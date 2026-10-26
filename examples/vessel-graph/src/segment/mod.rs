@@ -46,7 +46,7 @@ pub use binarize::{
     Adaptive, BinarizeParams, Binarized, Deconvolve, Equalize, Lightsheet, Vesselize,
 };
 pub use clip::ClipParams;
-pub use deep_fill::{deep_fill, DeepFillOutput, DeepFillParams, DeepFillSetup};
+pub use deep_fill::{deep_fill, DeepFillDevice, DeepFillOutput, DeepFillParams, DeepFillSetup};
 pub use params::{ChannelOverrides, ChannelRole, PostOverrides, SegmentOverrides};
 pub use pipeline::{
     binarize as binarize_volume, binarize_plan, mask_steps, segment, segment_plan, ChannelParams,

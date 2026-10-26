@@ -17,7 +17,7 @@ use blockflow::ops::{
 use blockflow::strategy::{execute_phases, Hints};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::{PhysicalFrame, PyramidSpec, ZarrEnvironment};
-use ndarray::{s, Array3};
+use ndarray::{s, Array3, Axis};
 use rayon::prelude::*;
 use serde_json::Value;
 
@@ -61,6 +61,12 @@ impl Volume {
             .rev()
             .find(|level| fits(&self.frames[*level]))
             .unwrap_or(0)
+    }
+
+    /// The bytes [`Self::read`] allocates for `level`, as stored.
+    pub fn stored_bytes(&self, level: usize) -> Result<u64> {
+        let (dtype, shape) = self.pyramid.attached_level(level)?.metadata()?;
+        Ok(crate::memory::voxels(shape) * dtype.size_of() as u64)
     }
 
     pub fn read(&self, level: usize) -> Result<Voxels> {
@@ -184,8 +190,10 @@ pub fn lattice_over(
 /// `source` (on `source_frame`) resampled onto `target`, through a point map
 /// from target physical coordinates to source physical coordinates.
 ///
-/// Resident: the registration lattice is small by construction. Slabs of
-/// planes are computed in parallel, each with `ops::transform::remap_into`.
+/// Resident: the registration lattice is small by construction. Planes are
+/// computed in parallel straight into the output, a row at a time with
+/// `ops::transform::remap_into`, so the only memory beside the source and the
+/// output is [`warp_scratch_bytes`].
 pub fn warp(
     source: &Array3<f64>,
     source_frame: &Frame,
@@ -194,52 +202,46 @@ pub fn warp(
     map: &(dyn Fn([f64; 3]) -> [f64; 3] + Sync),
     interpolation: TransformInterpolation,
 ) -> Result<Array3<f64>> {
-    const SLAB: usize = 8;
     let [nz, ny, nx] = target_shape;
-    let slabs = (0..nz.div_ceil(SLAB))
+    let mut out = Array3::<f64>::zeros((nz, ny, nx));
+    let planes: Vec<_> = out.axis_iter_mut(Axis(0)).enumerate().collect();
+    planes
         .into_par_iter()
-        .map(|slab| {
-            let z0 = slab * SLAB;
-            let depth = SLAB.min(nz - z0);
+        .try_for_each(|(z, mut plane)| -> Result<()> {
             let mut coordinates = [
-                Array3::<f64>::zeros((depth, ny, nx)),
-                Array3::<f64>::zeros((depth, ny, nx)),
-                Array3::<f64>::zeros((depth, ny, nx)),
+                Array3::<f64>::zeros((1, 1, nx)),
+                Array3::<f64>::zeros((1, 1, nx)),
+                Array3::<f64>::zeros((1, 1, nx)),
             ];
-            for z in 0..depth {
-                for y in 0..ny {
-                    for x in 0..nx {
-                        let physical = target.to_physical([(z0 + z) as f64, y as f64, x as f64]);
-                        let at = source_frame.to_index(map(physical));
-                        for axis in 0..3 {
-                            coordinates[axis][[z, y, x]] = at[axis];
-                        }
+            for y in 0..ny {
+                for x in 0..nx {
+                    let physical = target.to_physical([z as f64, y as f64, x as f64]);
+                    let at = source_frame.to_index(map(physical));
+                    for axis in 0..3 {
+                        coordinates[axis][[0, 0, x]] = at[axis];
                     }
                 }
+                let [cz, cy, cx] = &coordinates;
+                let row = plane.slice_mut(s![y..y + 1, ..]).insert_axis(Axis(0));
+                remap_into(
+                    source.view(),
+                    [cz.view(), cy.view(), cx.view()],
+                    interpolation,
+                    TransformBoundary::Constant(0.0),
+                    row,
+                )?;
             }
-            let mut out = Array3::<f64>::zeros((depth, ny, nx));
-            let [cz, cy, cx] = &coordinates;
-            remap_into(
-                source.view(),
-                [cz.view(), cy.view(), cx.view()],
-                interpolation,
-                TransformBoundary::Constant(0.0),
-                out.view_mut(),
-            )?;
-            Ok((z0, out))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut out = Array3::<f64>::zeros((nz, ny, nx));
-    for (z0, slab) in slabs {
-        let depth = slab.shape()[0];
-        out.slice_mut(s![z0..z0 + depth, .., ..]).assign(&slab);
-    }
+            Ok(())
+        })?;
     Ok(out)
 }
 
-/// Write `image` as an OME-Zarr 0.5 multiscale image at `root`, with level 0
-/// on `frame` and 2x block-mean levels below it until an axis would drop
-/// under 16 voxels.
+/// What [`warp`] holds beside its source and its output: three rows of
+/// coordinates per worker.
+pub fn warp_scratch_bytes(target_shape: [usize; 3]) -> u64 {
+    (rayon::current_num_threads() * 3 * target_shape[2] * 8) as u64
+}
+
 pub fn write_image(root: &Path, image: &Voxels, frame: &Frame, unit: Option<&str>) -> Result<()> {
     let shape = image.shape();
     let mut levels = 1;

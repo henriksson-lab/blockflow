@@ -18,11 +18,14 @@
 //! maximum of the norms is not the norm of the per-axis maxima. Rebuilding one
 //! from the other would be wrong at every clique whose members disagree.
 
+use std::sync::Arc;
+
 use blockflow::error::{Error, Result};
 
 use super::clean::{CleanGraph, CleanVertex};
 use super::raw::RawGraph;
 use super::reduce::ReducedGraph;
+use super::store::{RadiusKind, Stops, Values};
 
 /// How a group of rows folds into one. `total_cmp`, so a NaN or a signed zero
 /// gives the same answer in every order.
@@ -123,6 +126,10 @@ impl Column {
         &self.values
     }
 
+    pub(crate) fn into_values(self) -> Vec<f64> {
+        self.values
+    }
+
     pub fn to_rows3(&self) -> Result<Vec<[f64; 3]>> {
         if self.width != 3 {
             return Err(Error::invalid(format!(
@@ -169,6 +176,99 @@ impl Column {
                 ))),
             })
             .collect()
+    }
+}
+
+/// A per-raw-vertex column as it is carried: values in the narrowest store
+/// that gives them back exactly, or the radius walk's stops read as one of
+/// the four radius arrays (four columns, one `u32` a vertex between them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawColumn {
+    width: usize,
+    kind: RawKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum RawKind {
+    Dense(Arc<Values>),
+    Stops(Arc<Stops>, RadiusKind),
+}
+
+impl RawColumn {
+    pub(crate) fn dense(width: usize, values: Values) -> Result<Self> {
+        if width == 0 || !values.len().is_multiple_of(width) {
+            return Err(Error::invalid(format!(
+                "{} values do not divide into rows of {width}.",
+                values.len()
+            )));
+        }
+        Ok(Self {
+            width,
+            kind: RawKind::Dense(Arc::new(values)),
+        })
+    }
+
+    pub(crate) fn stops(stops: Arc<Stops>, kind: RadiusKind) -> Self {
+        Self {
+            width: kind.width(),
+            kind: RawKind::Stops(stops, kind),
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.kind {
+            RawKind::Dense(values) => values.len() / self.width,
+            RawKind::Stops(stops, _) => stops.stops.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Row `row`'s value on `axis` (`0` for a scalar).
+    #[inline]
+    pub fn value(&self, row: usize, axis: usize) -> f64 {
+        match &self.kind {
+            RawKind::Dense(values) => values.get(row * self.width + axis),
+            RawKind::Stops(stops, kind) => stops.value(row, *kind, axis),
+        }
+    }
+
+    /// The column as plain `f64` rows.
+    pub fn to_column(&self) -> Column {
+        let mut values = Vec::with_capacity(self.len() * self.width);
+        for row in 0..self.len() {
+            for axis in 0..self.width {
+                values.push(self.value(row, axis));
+            }
+        }
+        Column {
+            width: self.width,
+            values,
+        }
+    }
+
+    /// The bytes it holds, shared stops counted in full.
+    pub fn bytes(&self) -> usize {
+        match &self.kind {
+            RawKind::Dense(values) => values.bytes(),
+            RawKind::Stops(stops, _) => stops.stops.len() * 4,
+        }
+    }
+}
+
+impl From<Column> for RawColumn {
+    fn from(column: Column) -> Self {
+        let width = column.width;
+        Self {
+            width,
+            kind: RawKind::Dense(Arc::new(Values::of(column.values))),
+        }
     }
 }
 

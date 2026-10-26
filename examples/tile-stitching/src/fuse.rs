@@ -30,7 +30,7 @@ use blockflow::geometry::BlockGrid;
 use blockflow::region::Region;
 use blockflow::voxels::{VoxelElement, Voxels};
 use blockflow::Dtype;
-use ndarray::{Array3, ArrayView3};
+use ndarray::{Array3, ArrayView3, ArrayViewMut3};
 use rayon::prelude::*;
 
 use crate::place::PlacedLayout;
@@ -316,17 +316,52 @@ fn weight(local: [usize; 2], shape: [usize; 2], weighting: Weighting) -> f64 {
     }
 }
 
-/// The whole volume.
+/// The whole volume, by the planned fusion ([`crate::planned`]) over views
+/// of the tiles: slab by slab along the wobble axis, each slab's chunks in
+/// parallel into one reused slab buffer, under the memory cap; nothing is held
+/// beside the tiles and the volume but that slab. The same voxels as
+/// [`blocked`] on any lattice.
 pub fn resident(params: &FuseParams, tiles: &[Voxels], placement: &Placement) -> Result<Voxels> {
     let shape = placement.shape()?;
-    // Slabs along the wobble axis: the planes are independent, so this is the
-    // natural parallel split.
-    let mut block = shape;
-    block[placement.axis()] = 8.min(shape[placement.axis()]);
-    blocked(params, tiles, placement, &BlockGrid::new(shape, block)?)
+    let dtype = check_tiles(tiles, placement)?;
+    let region = Region::new(&[0, 0, 0], &shape);
+    let axis = placement.axis();
+    let chunk = blockflow::zarr_env::chunk_for_extent(shape, dtype);
+    let (rows, _) = crate::planned::fused_slab_rows(placement, &region, &[], axis, chunk, dtype);
+    blockflow::dtype_dispatch!(
+        dtype,
+        |Element| {
+            let views = tiles
+                .iter()
+                .map(|tile| tile.view::<Element>())
+                .collect::<Result<Vec<_>>>()?;
+            let mut out = Array3::<Element>::from_elem(shape, Element::from_f64(0.0));
+            let mut at = 0;
+            crate::planned::fuse_planned_boxes::<Element, [ArrayView3<'_, Element>]>(
+                params,
+                placement,
+                &views[..],
+                &region,
+                axis,
+                rows,
+                chunk,
+                false,
+                |slab| {
+                    let n = slab.len_of(ndarray::Axis(axis));
+                    out.slice_axis_mut(ndarray::Axis(axis), ndarray::Slice::from(at..at + n))
+                        .assign(&slab);
+                    at += n;
+                    Ok(())
+                },
+            )?;
+            Ok(Element::wrap(out))
+        },
+        f16 => Err(Error::invalid("float16 tiles cannot be fused"))
+    )
 }
 
-/// The volume assembled block by block over `grid`, blocks in parallel.
+/// The volume assembled block by block over `grid`, blocks in parallel, each
+/// written into the volume as it is done.
 pub fn blocked(
     params: &FuseParams,
     tiles: &[Voxels],
@@ -341,21 +376,16 @@ pub fn blocked(
         });
     }
     let dtype = check_tiles(tiles, placement)?;
-    let blocks = grid
-        .cores()
-        .into_par_iter()
-        .map(|core| {
-            Ok((
-                fuse_region(params, tiles, placement, &core.core)?,
-                core.core,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut out = Voxels::zeros(dtype, shape)?;
-    for (block, region) in blocks {
-        out.assign_region(&region, &block)?;
-    }
-    Ok(out)
+    let out = std::sync::Mutex::new(Voxels::zeros(dtype, shape)?);
+    grid.cores().into_par_iter().try_for_each(|core| {
+        let block = fuse_region(params, tiles, placement, &core.core)?;
+        out.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .assign_region(&core.core, &block)
+    })?;
+    Ok(out
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 fn check_tiles(tiles: &[Voxels], placement: &Placement) -> Result<Dtype> {
@@ -433,14 +463,28 @@ pub(crate) fn fuse_with<T: VoxelElement>(
     placement: &Placement,
     region: &Region,
 ) -> Array3<T> {
-    let origin = placement.origin();
-    let axis = placement.axis();
-    let plane = plane_axes(axis);
-    let floating = matches!(T::DTYPE, Dtype::F32 | Dtype::F64);
     let mut out = Array3::from_elem(
         (region.shape[0], region.shape[1], region.shape[2]),
         T::from_f64(0.0),
     );
+    fuse_into(params, sample, placement, region, out.view_mut());
+    out
+}
+
+/// [`fuse_with`], into `out` (of `region`'s shape), which it overwrites.
+pub(crate) fn fuse_into<T: VoxelElement>(
+    params: &FuseParams,
+    sample: impl Fn(usize, [usize; 3]) -> f64,
+    placement: &Placement,
+    region: &Region,
+    mut out: ArrayViewMut3<'_, T>,
+) {
+    debug_assert_eq!(out.shape(), &region.shape[..]);
+    out.fill(T::from_f64(0.0));
+    let origin = placement.origin();
+    let axis = placement.axis();
+    let plane = plane_axes(axis);
+    let floating = matches!(T::DTYPE, Dtype::F32 | Dtype::F64);
     let lower: [i64; 3] = std::array::from_fn(|a| origin[a] + region.start[a] as i64);
     let upper: [i64; 3] = std::array::from_fn(|a| lower[a] + region.shape[a] as i64);
     let mut covering = Vec::with_capacity(placement.sources().len());
@@ -514,7 +558,6 @@ pub(crate) fn fuse_with<T: VoxelElement>(
             }
         }
     }
-    out
 }
 
 /// The box of each tile (tile coordinates, half-open `start..stop`) that

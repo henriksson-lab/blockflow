@@ -73,14 +73,14 @@ use rayon::prelude::*;
 const CONV3_ROWS: usize = 1 << 14;
 
 /// One convolution's weight and bias, already on the device.
-struct Conv {
+pub(super) struct Conv {
     weight: Tensor<5>,
     bias: Tensor<1>,
     options: ConvOptions<3>,
 }
 
 impl Conv {
-    fn apply(&self, x: Tensor<5>) -> Tensor<5> {
+    pub(super) fn apply(&self, x: Tensor<5>) -> Tensor<5> {
         conv3d(
             x,
             self.weight.clone(),
@@ -91,15 +91,15 @@ impl Conv {
 }
 
 /// A float32 tensor of a safetensors file.
-struct Stored {
-    shape: Vec<usize>,
-    data: Vec<f32>,
+pub(super) struct Stored {
+    pub shape: Vec<usize>,
+    pub data: Vec<f32>,
 }
 
 /// Read every tensor of a safetensors file. Only `F32` tensors are accepted:
 /// the reference's weights are float32, and `reference-clearmap/convert_weights.py`
 /// writes them so.
-fn read_safetensors(path: &Path) -> Result<BTreeMap<String, Stored>> {
+pub(super) fn read_safetensors(path: &Path) -> Result<BTreeMap<String, Stored>> {
     let bytes = fs::read(path).map_err(|error| {
         Error::invalid(format!(
             "reading the vessel-filling weights {}: {error}",
@@ -171,7 +171,7 @@ fn read_safetensors(path: &Path) -> Result<BTreeMap<String, Stored>> {
 
 /// A `[a, b, k, k, k]` kernel with its three spatial axes reversed, from the
 /// reference's `[x, y, z]` order to this crate's `[z, y, x]`.
-fn reverse_spatial(stored: &Stored) -> Vec<f32> {
+pub(super) fn reverse_spatial(stored: &Stored) -> Vec<f32> {
     let [a, b, k0, k1, k2] = stored.shape[..] else {
         unreachable!("checked to be five-dimensional");
     };
@@ -209,21 +209,28 @@ struct Conv4 {
 /// The trained vessel-filling network.
 pub struct Network {
     device: Device,
-    conv1: Conv,
-    conv2: Conv,
-    depthwise: Conv,
-    pointwise: Conv,
-    convbin1: Conv,
+    encoder: [Conv; 5],
     conv3: Conv3,
     conv4: Conv4,
 }
 
-impl Network {
-    /// Load the reference's trained weights (its state-dict names) from a
+/// The network's tensors as read from a safetensors file, every shape
+/// checked; what [`Network`] and the GPU network are built from.
+pub(super) struct Weights {
+    pub conv1: (Stored, Stored),
+    pub conv2: (Stored, Stored),
+    pub depthwise: (Stored, Stored),
+    pub pointwise: (Stored, Stored),
+    pub convbin1: (Stored, Stored),
+    pub conv3: (Stored, Stored),
+    pub conv4: (Stored, Stored),
+}
+
+impl Weights {
+    /// Read the reference's trained weights (its state-dict names) from a
     /// safetensors file.
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn read(path: &Path) -> Result<Self> {
         let mut tensors = read_safetensors(path)?;
-        let device = Device::flex();
         let mut take = |name: &str, shape: &[usize]| -> Result<Stored> {
             let stored = tensors.remove(name).ok_or_else(|| {
                 Error::invalid(format!(
@@ -240,73 +247,102 @@ impl Network {
             }
             Ok(stored)
         };
-        let conv = |weight: Stored, bias: Stored, stride: usize, padding: usize, groups: usize| {
-            let shape: [usize; 5] = weight.shape[..].try_into().expect("checked");
-            Conv {
-                weight: Tensor::<5>::from_data(
-                    TensorData::new(reverse_spatial(&weight), shape),
-                    &device,
-                ),
-                bias: Tensor::<1>::from_data(TensorData::new(bias.data, [shape[0]]), &device),
-                options: ConvOptions::new([stride; 3], [padding; 3], [1; 3], groups),
-            }
-        };
-        let conv1 = conv(
-            take("conv1.weight", &[16, 1, 7, 7, 7])?,
-            take("conv1.bias", &[16])?,
-            2,
-            3,
-            1,
-        );
-        let conv2 = conv(
-            take("conv2.weight", &[32, 16, 5, 5, 5])?,
-            take("conv2.bias", &[32])?,
-            1,
-            2,
-            1,
-        );
-        let depthwise = conv(
-            take("desepconv4.depthwise.weight", &[32, 1, 3, 3, 3])?,
-            take("desepconv4.depthwise.bias", &[32])?,
-            1,
-            1,
-            32,
-        );
-        let pointwise = conv(
-            take("desepconv4.pointwise.weight", &[32, 32, 1, 1, 1])?,
-            take("desepconv4.pointwise.bias", &[32])?,
-            1,
-            0,
-            1,
-        );
-        let convbin1 = conv(
-            take("convbin1.weight", &[32, 32, 3, 3, 3])?,
-            take("convbin1.bias", &[32])?,
-            1,
-            1,
-            1,
-        );
-        let conv3 = Conv3::new(
-            &take("conv3.weight", &[32, 16, 7, 7, 7])?,
-            &take("conv3.bias", &[16])?,
-            &device,
-        );
-        let conv4_weight = take("conv4.weight", &[2, 17, 3, 3, 3])?;
-        let conv4_bias = take("conv4.bias", &[2])?;
-        let conv4 = Conv4 {
-            weight: reverse_spatial(&conv4_weight),
-            bias: [conv4_bias.data[0], conv4_bias.data[1]],
-        };
         Ok(Self {
-            device,
-            conv1,
-            conv2,
-            depthwise,
-            pointwise,
-            convbin1,
-            conv3,
-            conv4,
+            conv1: (
+                take("conv1.weight", &[16, 1, 7, 7, 7])?,
+                take("conv1.bias", &[16])?,
+            ),
+            conv2: (
+                take("conv2.weight", &[32, 16, 5, 5, 5])?,
+                take("conv2.bias", &[32])?,
+            ),
+            depthwise: (
+                take("desepconv4.depthwise.weight", &[32, 1, 3, 3, 3])?,
+                take("desepconv4.depthwise.bias", &[32])?,
+            ),
+            pointwise: (
+                take("desepconv4.pointwise.weight", &[32, 32, 1, 1, 1])?,
+                take("desepconv4.pointwise.bias", &[32])?,
+            ),
+            convbin1: (
+                take("convbin1.weight", &[32, 32, 3, 3, 3])?,
+                take("convbin1.bias", &[32])?,
+            ),
+            conv3: (
+                take("conv3.weight", &[32, 16, 7, 7, 7])?,
+                take("conv3.bias", &[16])?,
+            ),
+            conv4: (
+                take("conv4.weight", &[2, 17, 3, 3, 3])?,
+                take("conv4.bias", &[2])?,
+            ),
         })
+    }
+}
+
+impl Conv {
+    /// A convolution of `weight` (spatial axes reversed) and `bias` on
+    /// `device`.
+    pub(super) fn new(
+        (weight, bias): &(Stored, Stored),
+        stride: usize,
+        padding: usize,
+        groups: usize,
+        device: &Device,
+    ) -> Self {
+        let shape: [usize; 5] = weight.shape[..].try_into().expect("checked");
+        Conv {
+            weight: Tensor::<5>::from_data(TensorData::new(reverse_spatial(weight), shape), device),
+            bias: Tensor::<1>::from_data(TensorData::new(bias.data.clone(), [shape[0]]), device),
+            options: ConvOptions::new([stride; 3], [padding; 3], [1; 3], groups),
+        }
+    }
+}
+
+/// The encoder's five convolutions on `device`: conv1, conv2, depthwise,
+/// pointwise, convbin1.
+pub(super) fn encoder(weights: &Weights, device: &Device) -> [Conv; 5] {
+    [
+        Conv::new(&weights.conv1, 2, 3, 1, device),
+        Conv::new(&weights.conv2, 1, 2, 1, device),
+        Conv::new(&weights.depthwise, 1, 1, 32, device),
+        Conv::new(&weights.pointwise, 1, 0, 1, device),
+        Conv::new(&weights.convbin1, 1, 1, 1, device),
+    ]
+}
+
+/// `conv1` to `convbin1` with their relus: the coarse features, `[1, 32, n /
+/// 8]`, of the max-pooled input `x` (`[1, 1, n / 2]`).
+pub(super) fn encode(convs: &[Conv; 5], x: Tensor<5>) -> Tensor<5> {
+    let [conv1, conv2, depthwise, pointwise, convbin1] = convs;
+    let x = relu(conv1.apply(x));
+    let x = max_pool2(x);
+    let x = relu(conv2.apply(x));
+    let x = pointwise.apply(depthwise.apply(x));
+    relu(convbin1.apply(x))
+}
+
+impl Network {
+    /// Load the reference's trained weights (its state-dict names) from a
+    /// safetensors file.
+    pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::new(&Weights::read(path)?))
+    }
+
+    /// The network of `weights`, on burn's CPU backend.
+    pub(super) fn new(weights: &Weights) -> Self {
+        let device = Device::flex();
+        let conv4_weight = &weights.conv4.0;
+        let conv4_bias = &weights.conv4.1;
+        Self {
+            encoder: encoder(weights, &device),
+            conv3: Conv3::new(&weights.conv3.0, &weights.conv3.1, &device),
+            conv4: Conv4 {
+                weight: reverse_spatial(conv4_weight),
+                bias: [conv4_bias.data[0], conv4_bias.data[1]],
+            },
+            device,
+        }
     }
 
     /// The foreground probability of a binary volume `shape` (`[z, y, x]`,
@@ -331,11 +367,7 @@ impl Network {
             ),
             &self.device,
         );
-        let x = relu(self.conv1.apply(x));
-        let x = max_pool2(x);
-        let x = relu(self.conv2.apply(x));
-        let x = self.pointwise.apply(self.depthwise.apply(x));
-        let x = relu(self.convbin1.apply(x));
+        let x = encode(&self.encoder, x);
         let [_, channels, c0, c1, c2] = x.dims();
         let coarse = host(x)?;
         let up = upsample2_host(&coarse, channels, [c0, c1, c2]);
@@ -354,49 +386,57 @@ pub fn output_length(n: usize) -> usize {
     8 * ((n + 2) / 8) - 2
 }
 
-fn host<const D: usize>(tensor: Tensor<D>) -> Result<Vec<f32>> {
+pub(super) fn host<const D: usize>(tensor: Tensor<D>) -> Result<Vec<f32>> {
     tensor
         .into_data()
         .try_into_vec::<f32>()
         .map_err(|error| Error::backend(format!("vessel filling: {error:?}")))
 }
 
-impl Conv3 {
-    /// `ConvTranspose3d(32, 16, 7, stride 2, padding 3)` as a polyphase
-    /// convolution. Per axis, output `o = 2 m + p` collects the inputs `i`
-    /// with `o = 2 i - 3 + k`: for parity `p = 0` the taps `k = 5, 3, 1` at
-    /// `i = m - 1, m, m + 1`, for `p = 1` the taps `k = 6, 4, 2, 0` at
-    /// `i = m - 1 ..= m + 2`. So a 4-tap window starting at `m - 1` with
-    /// kernel `k = p + 5 - 2 t` (zero where that is negative) gives either
-    /// parity.
-    fn new(weight: &Stored, bias: &Stored, device: &Device) -> Self {
-        let reversed = reverse_spatial(weight);
-        let (c_in, c_out, k) = (32, 16, 7);
-        let at = |ci: usize, co: usize, z: usize, y: usize, x: usize| {
-            reversed[(((ci * c_out + co) * k + z) * k + y) * k + x]
-        };
-        let kernel = |p: usize, t: usize| (p + 5).checked_sub(2 * t);
-        let mut matrix = vec![0.0f32; 64 * c_in * c_out * 8];
-        for tap in 0..64 {
-            let t = [tap / 16, (tap / 4) % 4, tap % 4];
-            let matrix = &mut matrix[tap * c_in * c_out * 8..][..c_in * c_out * 8];
-            {
-                for ci in 0..c_in {
-                    for co in 0..c_out {
-                        for parity in 0..8 {
-                            let p = [parity >> 2, (parity >> 1) & 1, parity & 1];
-                            if let (Some(kz), Some(ky), Some(kx)) =
-                                (kernel(p[0], t[0]), kernel(p[1], t[1]), kernel(p[2], t[2]))
-                            {
-                                matrix[ci * c_out * 8 + co * 8 + parity] = at(ci, co, kz, ky, kx);
-                            }
-                        }
+/// `conv3`'s weight (`[32, 16, 7, 7, 7]`, the reference's axis order) as the
+/// polyphase matrix `[64 * 32, 16 * 8]` of [`Conv3`]: row `32 t + ci` for tap
+/// `t` and input channel `ci`, column `8 c + parity`. Per axis, output `o = 2
+/// m + p` collects the inputs `i` with `o = 2 i - 3 + k`: for parity `p = 0`
+/// the taps `k = 5, 3, 1` at `i = m - 1, m, m + 1`, for `p = 1` the taps `k =
+/// 6, 4, 2, 0` at `i = m - 1 ..= m + 2`. So a 4-tap window starting at `m - 1`
+/// with kernel `k = p + 5 - 2 t` (zero where that is negative) gives either
+/// parity.
+pub(super) fn polyphase_matrix(weight: &Stored) -> Vec<f32> {
+    let reversed = reverse_spatial(weight);
+    let (c_in, c_out, k) = (32, 16, 7);
+    let at = |ci: usize, co: usize, z: usize, y: usize, x: usize| {
+        reversed[(((ci * c_out + co) * k + z) * k + y) * k + x]
+    };
+    let kernel = |p: usize, t: usize| (p + 5).checked_sub(2 * t);
+    let mut matrix = vec![0.0f32; 64 * c_in * c_out * 8];
+    for tap in 0..64 {
+        let t = [tap / 16, (tap / 4) % 4, tap % 4];
+        let matrix = &mut matrix[tap * c_in * c_out * 8..][..c_in * c_out * 8];
+        for ci in 0..c_in {
+            for co in 0..c_out {
+                for parity in 0..8 {
+                    let p = [parity >> 2, (parity >> 1) & 1, parity & 1];
+                    if let (Some(kz), Some(ky), Some(kx)) =
+                        (kernel(p[0], t[0]), kernel(p[1], t[1]), kernel(p[2], t[2]))
+                    {
+                        matrix[ci * c_out * 8 + co * 8 + parity] = at(ci, co, kz, ky, kx);
                     }
                 }
             }
         }
+    }
+    matrix
+}
+
+impl Conv3 {
+    /// `ConvTranspose3d(32, 16, 7, stride 2, padding 3)` as a polyphase
+    /// convolution ([`polyphase_matrix`]).
+    fn new(weight: &Stored, bias: &Stored, device: &Device) -> Self {
         Self {
-            kernel: Tensor::<2>::from_data(TensorData::new(matrix, [64 * c_in, c_out * 8]), device),
+            kernel: Tensor::<2>::from_data(
+                TensorData::new(polyphase_matrix(weight), [64 * 32, 16 * 8]),
+                device,
+            ),
             bias: bias.data.clone(),
         }
     }
@@ -666,7 +706,7 @@ fn max_pool2_host(input: &[f32], shape: [usize; 3]) -> Vec<f32> {
 }
 
 /// `MaxPool3d(2)`: floor, as the reference's.
-fn max_pool2(x: Tensor<5>) -> Tensor<5> {
+pub(super) fn max_pool2(x: Tensor<5>) -> Tensor<5> {
     let mut x = x;
     for dim in 2..5 {
         let dims = x.dims();

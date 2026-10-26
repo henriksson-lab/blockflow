@@ -141,7 +141,7 @@ use crate::fragment::{
     BlockOutput, BlockView, FragmentInput, FragmentOp, FragmentOutput, SeamFold, SourceBlocks,
 };
 use crate::op::SourceInput;
-use crate::ops::rows::{value_at, Limit, RowStreams};
+use crate::ops::rows::{value_at, Limit, ReadAsF64, RowStreams};
 use crate::ops::TypedSource;
 use crate::reach::Reach;
 use crate::region::Region;
@@ -498,6 +498,21 @@ pub fn walk_from(
     origin: [usize; 3],
     stop: Limit,
 ) -> Result<Option<usize>> {
+    // The image's type is matched once, and each offset read from the typed
+    // slice: the same reads and the same answers as through `value_at`.
+    macro_rules! typed {
+        ($($variant:ident),*) => {
+            match pixels {
+                $(Voxels::$variant(array) => {
+                    if let Some(values) = array.as_slice() {
+                        return walk_slice(sequence, at, volume, pixels, values, origin, stop);
+                    }
+                })*
+                _ => {}
+            }
+        };
+    }
+    typed!(Bool, U8, U16, U32, I8, I16, I32, F32, F64);
     let window = pixels.shape();
     'offsets: for (index, offset) in sequence.offsets().iter().enumerate() {
         let mut local = [0usize; 3];
@@ -511,16 +526,9 @@ pub fn walk_from(
             }
             let target = target as usize;
             if target < origin[axis] || target - origin[axis] >= window[axis] {
-                return Err(Error::invalid(format!(
-                    "a walk from {at:?} reached {target} on axis {axis} — offset {offset:?} — \
-                     which is inside the volume {volume:?} and outside the window this block \
-                     was handed, which starts at {origin:?} and is shaped {window:?}. The \
-                     walk cannot be continued and it must not be ended, because ending it \
-                     would report the distance reached so far as though the array had \
-                     justified it. The operand reach must be at least the sequence's stated \
-                     maximum {:?} on every axis.",
-                    sequence.maximum()
-                )));
+                return Err(outside_window(
+                    sequence, at, target, axis, *offset, volume, origin, window,
+                ));
             }
             local[axis] = target - origin[axis];
         }
@@ -529,6 +537,73 @@ pub fn walk_from(
         }
     }
     Ok(None)
+}
+
+/// [`walk_from`] over the standard-layout values of `pixels`, typed.
+fn walk_slice<T: ReadAsF64>(
+    sequence: &OffsetSequence,
+    at: [usize; 3],
+    volume: [usize; 3],
+    pixels: &Voxels,
+    values: &[T],
+    origin: [usize; 3],
+    stop: Limit,
+) -> Result<Option<usize>> {
+    let window = pixels.shape();
+    let strides = [window[1] * window[2], window[2], 1];
+    'offsets: for (index, offset) in sequence.offsets().iter().enumerate() {
+        let mut linear = 0usize;
+        for axis in 0..3 {
+            let target = at[axis] as isize + offset[axis];
+            if target < 0 || target >= volume[axis] as isize {
+                continue 'offsets;
+            }
+            let target = target as usize;
+            if target < origin[axis] || target - origin[axis] >= window[axis] {
+                return Err(outside_window(
+                    sequence, at, target, axis, *offset, volume, origin, window,
+                ));
+            }
+            linear += (target - origin[axis]) * strides[axis];
+        }
+        let value = values[linear].read_as_f64();
+        if !T::ALWAYS_FINITE && !value.is_finite() {
+            // `value_at` names the voxel and refuses it.
+            let local = [
+                linear / strides[0],
+                linear % strides[0] / strides[1],
+                linear % strides[1],
+            ];
+            value_at(pixels, local)?;
+        }
+        if stop.holds(value) {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal of a walk that reached past its window inside the volume.
+fn outside_window(
+    sequence: &OffsetSequence,
+    at: [usize; 3],
+    target: usize,
+    axis: usize,
+    offset: [isize; 3],
+    volume: [usize; 3],
+    origin: [usize; 3],
+    window: [usize; 3],
+) -> Error {
+    Error::invalid(format!(
+        "a walk from {at:?} reached {target} on axis {axis} — offset {offset:?} — \
+         which is inside the volume {volume:?} and outside the window this block \
+         was handed, which starts at {origin:?} and is shaped {window:?}. The \
+         walk cannot be continued and it must not be ended, because ending it \
+         would report the distance reached so far as though the array had \
+         justified it. The operand reach must be at least the sequence's stated \
+         maximum {:?} on every axis.",
+        sequence.maximum()
+    ))
 }
 
 /// The distance a walk's outcome reports: the stopping offset's, or

@@ -39,7 +39,7 @@ use crate::profile::{Listening, Profile};
 
 use super::clip::ClipParams;
 use super::crop::write_crop;
-use super::deep_fill::DeepFillSetup;
+use super::deep_fill::{DeepFillDevice, DeepFillSetup};
 use super::params::{ChannelOverrides, ChannelRole, PostOverrides, SegmentOverrides};
 use super::pipeline::{append_segment_phases, append_segment_phases_unthinned, SegmentParams};
 use super::plan::{workers, Cursor, Image};
@@ -292,6 +292,11 @@ pub struct SegmentArgs {
     /// the network whole, with a halo of 64 voxels (128 at resample 2).
     #[arg(long, value_delimiter = ',', default_values_t = vec![256, 512, 512])]
     pub deep_fill_block: Vec<usize>,
+    /// Where the deep-filling network runs: cpu, gpu, or auto (the GPU when
+    /// the build has a GPU runtime, `--features deep-fill-cuda`, and a device
+    /// is reachable; otherwise the CPU).
+    #[arg(long, alias = "device", default_value = "auto")]
+    pub deep_fill_device: String,
 }
 
 impl SegmentArgs {
@@ -395,6 +400,7 @@ impl SegmentArgs {
         params.deep_fill = DeepFillSetup {
             weights: self.deep_fill_weights.clone(),
             block: triple(&self.deep_fill_block, "--deep-fill-block")?,
+            device: DeepFillDevice::parse(&self.deep_fill_device)?,
         };
         Ok((params, roles))
     }

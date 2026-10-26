@@ -29,12 +29,16 @@
 //! unique stopping offset. A vertex whose walk finds no background is reported
 //! as [`NOT_FOUND`] in every array and flagged in [`RadiusMeasurement::found`].
 
+use std::sync::Arc;
+
 use blockflow::error::{Error, Result};
 use blockflow::ops::rows::Limit;
 use blockflow::ops::walk::{walk_from, OffsetSequence};
 use blockflow::voxels::Voxels;
 
-use super::columns::{norm, Column};
+use super::columns::{norm, Column, RawColumn};
+use super::store::{RadiusKind, Stops};
+use super::vessel::Carried;
 
 /// The radius reported where the walk found no background voxel.
 pub const NOT_FOUND: f64 = -1.0;
@@ -153,12 +157,17 @@ impl RadiusSearch {
         spacing: [f64; 3],
     ) -> Result<RadiusMeasurement> {
         check_spacing(spacing)?;
+        let stops = self.stops(source, points)?;
+        self.from_stops(&stops, spacing)
+    }
+
+    /// The walk's stop at every point of `source` (see [`Self::stop_at`]).
+    pub fn stops(&self, source: &Voxels, points: &[[u32; 3]]) -> Result<Vec<Option<usize>>> {
         let volume = source.shape();
-        let stops = points
+        points
             .iter()
             .map(|at| self.stop_at(source, [0, 0, 0], volume, *at))
-            .collect::<Result<Vec<_>>>()?;
-        self.from_stops(&stops, spacing)
+            .collect()
     }
 
     /// The walk from one point: the index of the offset it stopped at, `None`
@@ -251,6 +260,36 @@ fn check_spacing(spacing: [f64; 3]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The four radius arrays of one stop per raw vertex, as the columns the
+/// graph carries (folded by their maximum at cliques, the scalars by their
+/// maximum along edges): one `u32` a vertex between the four of them, read
+/// as [`RadiusSearch::from_stops`] writes them.
+pub fn carried_radii(
+    search: Arc<RadiusSearch>,
+    stops: &[Option<usize>],
+    spacing: [f64; 3],
+) -> Result<Vec<Carried>> {
+    let stops = stops
+        .iter()
+        .map(|stop| Stops::encode(*stop))
+        .collect::<Result<Vec<_>>>()?;
+    carried_stops(search, stops, spacing)
+}
+
+/// [`carried_radii`] of stops already encoded ([`Stops::NONE`] for none).
+pub(crate) fn carried_stops(
+    search: Arc<RadiusSearch>,
+    stops: Vec<u32>,
+    spacing: [f64; 3],
+) -> Result<Vec<Carried>> {
+    check_spacing(spacing)?;
+    let stops = Arc::new(Stops::new(search, stops, spacing)?);
+    Ok(RadiusKind::ALL
+        .iter()
+        .map(|(name, kind)| Carried::max(*name, RawColumn::stops(Arc::clone(&stops), *kind)))
+        .collect())
 }
 
 /// One-call form of [`RadiusSearch::measure`].

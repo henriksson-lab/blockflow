@@ -111,7 +111,7 @@ pub fn read_image_metadata(image_group: &Path) -> Result<ImageMetadataSnapshot> 
         None => ImageMetadataDocument::default(),
     };
     validate(&document)?;
-    Ok(snapshot(document)?)
+    snapshot(document)
 }
 
 pub fn replace_image_metadata(
@@ -123,6 +123,7 @@ pub fn replace_image_metadata(
     let lock_path = image_group.join(".rozt-image-metadata.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

@@ -26,14 +26,22 @@
 //! as the resident stages do over the whole volume: the walk and the balls
 //! never leave the window inside the volume, so every vertex gets the answer
 //! the whole volume gives, on every block grid. Its rows are the vertex list
-//! itself (the skeleton's set voxels), merged in lexicographic order, and it
-//! writes the skeleton's adjacent pairs of its core
-//! (`blockflow::ops::adjacency::encode_adjacent_pairs`, merged by
-//! `collect_pairs`), as [`super::build_blocked`] does.
+//! itself (the skeleton's set voxels), merged in lexicographic order, and
+//! each row says which of the voxel's lexicographically later neighbours
+//! (`blockflow::ops::adjacency::forward_offsets`) are skeleton too: the
+//! skeleton's adjacent pairs, a bit each, in the order
+//! [`super::build_blocked`] lists them ([`RawGraph::from_steps`]).
+//!
+//! **The collect** keeps each column in its narrowest store as it decodes
+//! the rows: a key and a row index per vertex for the sort, the stop as a
+//! `u32` (the four radius arrays are read off it), the neighbour bits, an
+//! intensity of a `uint16` channel as an `f32` and a mask as a byte.
 
 use std::path::PathBuf;
 
-use blockflow::assemble::{ImageId, PlanBuilder};
+use blockflow::assemble::{Assembly, ImageId, PlanBuilder};
+use blockflow::budget::{process_budget, process_cap, Lease, MemoryCap};
+use blockflow::decomposition::CostModel;
 use blockflow::env::{BlockBuf, Environment};
 use blockflow::fragment::{
     fold_fragments, BlockOutput, BlockView, Coverage, FragmentOp, FragmentOutput, SeamFold,
@@ -41,27 +49,34 @@ use blockflow::fragment::{
 };
 use blockflow::geometry::BlockGrid;
 use blockflow::op::{Anchor, BlockOp, Chain, SourceInput, SourceInputs};
-use blockflow::ops::adjacency::{collect_pairs, encode_adjacent_pairs};
-use blockflow::ops::Connectivity;
+use blockflow::ops::adjacency::forward_offsets;
 use blockflow::reach::Reach;
 use blockflow::sidecar::Lifecycle;
-use blockflow::strategy::{execute_phases, Hints};
+use blockflow::strategy::{choose_grid, execute_phases, expected_bytes_per_block, Hints, Host};
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::AttachedImage;
 use blockflow::{Dtype, Error, Result, ZarrEnvironment};
 use rayon::prelude::*;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::profile::{Listening, GRAPH};
 
-use super::columns::Column;
+use super::columns::RawColumn;
+use super::radius::carried_stops;
 use super::raw::{BuildParams, RawGraph};
 use super::signal::{search_radius, shift_um, Ball, Reduce};
+use super::store::{Narrow, Stops, Values};
 use super::vessel::Carried;
 use super::{GraphParams, RadiusSearch};
 
 const MEASURE_STREAM: &str = "graph.vertex-measure";
-const PAIRS_STREAM: &str = "graph.edges";
-const MEASURE_MAGIC: &[u8] = b"vessel-graph vertex measure v1";
+/// Per block, how many vertex rows it wrote: the graph's size, known before
+/// the rows are read.
+const COUNT_STREAM: &str = "graph.vertex-count";
+const MEASURE_MAGIC: &[u8] = b"vessel-graph vertex measure v2";
+/// A row's fixed part: the coordinate, the stop and the neighbour bits.
+const ROW_HEAD: usize = 12 + 4 + 2;
 
 /// The stored volumes a planned graph reads, each level 0 of an OME-Zarr
 /// array, all of one shape.
@@ -81,16 +96,50 @@ pub struct StoredInputs {
 /// How the planned stages run. None of it changes a result.
 #[derive(Debug, Clone)]
 pub struct PlanParams {
-    /// Block edge of the vertex measure, `z, y, x`.
-    pub block: [usize; 3],
-    /// Block edge of the pack, `z, y, x`: what holds the `uint64` labels.
-    pub pack_block: [usize; 3],
+    /// Block edge of the vertex measure, `z, y, x`; `None` for the grid the
+    /// planner prices fastest under the memory cap
+    /// (`blockflow::strategy::choose_grid`).
+    pub block: Option<[usize; 3]>,
+    /// Block edge of the pack, `z, y, x`: what holds the `uint64` labels;
+    /// `None` for the planner's choice.
+    pub pack_block: Option<[usize; 3]>,
     pub workers: usize,
     /// The chunk cache of the stored arrays, in bytes.
     pub cache_bytes: u64,
     /// Scratch directory for the packed masks; removed afterwards.
     pub work: PathBuf,
+    /// What the resident graph holds per raw vertex at its widest, leased
+    /// from the process's memory budget once the vertices are counted (and
+    /// held by the graph); `0` leases nothing. See [`GRAPH_BYTES_PER_VERTEX`].
+    pub resident_bytes_per_vertex: u64,
 }
+
+/// What the resident graph holds per raw vertex at its widest, measured on
+/// the osf-sa3x8 region and crop (`tests/graph_memory.rs`, which also holds
+/// a synthetic lattice to it): about 43 bytes while the vertex rows are
+/// collected and sorted, 54 while the graph is cleaned and 62 while it is
+/// reduced (the raw coordinates, 12, the radius stops, 4, and the signals,
+/// 5, beside the cleaned edges and their incidence), 40 for the assembled
+/// graph; with room for the allocator.
+pub const GRAPH_BYTES_PER_VERTEX: u64 = 72;
+
+/// What the atlas columns add per raw vertex (about a polyline point per raw
+/// vertex): `coordinates_atlas` as three `f64`s, the region, hemisphere and
+/// distance to surface each narrowed, and the lookups' batch of a quarter of
+/// a million points; measured at about 37 on the osf-sa3x8 region.
+pub const ATLAS_BYTES_PER_VERTEX: u64 = 48;
+
+/// The pack's compute per voxel of each label it reads, in the planner's
+/// unit (about a nanosecond): measured at 27 on the osf-sa3x8 region (7.3 s
+/// of CPU for three `uint64` labels of 67 M voxels), almost all of it the
+/// label chunks' decoding.
+const PACK_COST_PER_IMAGE: f64 = 27.0;
+
+/// The vertex measure's compute per voxel of its block: measured at 134 on
+/// the osf-sa3x8 region (9.0 s of CPU over 67 M voxels: the masks' bits and,
+/// per skeleton voxel, the radius walk and the signal balls), so it grows
+/// with the skeleton's density.
+const MEASURE_COST: f64 = 134.0;
 
 const VESSEL: u8 = 1;
 const SKELETON: u8 = 2;
@@ -156,7 +205,7 @@ impl BlockOp for PackMasksOp {
     }
 
     fn cost_per_voxel(&self) -> f64 {
-        1.0 + self.sources.len() as f64
+        PACK_COST_PER_IMAGE * (1.0 + self.sources.len() as f64)
     }
 }
 
@@ -200,16 +249,22 @@ struct Signal {
     shift_um: f64,
 }
 
-/// Per skeleton voxel of the core: the radius walk's stop and each signal's
-/// maximum over the vertex's ball; and the core's adjacent skeleton pairs.
-/// See the module header.
+/// Per skeleton voxel of the core: the radius walk's stop, which later
+/// neighbours are skeleton too, and each signal's maximum over the vertex's
+/// ball. See the module header.
 pub struct VertexMeasureOp {
     signals: Vec<Signal>,
-    search: RadiusSearch,
-    ball: Ball,
+    search: Arc<RadiusSearch>,
+    ball: Arc<Ball>,
     spacing: [f64; 3],
     reach: usize,
-    connectivity: Connectivity,
+    steps: Vec<[isize; 3]>,
+}
+
+impl VertexMeasureOp {
+    fn row_bytes(&self) -> usize {
+        ROW_HEAD + 8 * self.signals.len()
+    }
 }
 
 impl FragmentOp for VertexMeasureOp {
@@ -236,7 +291,7 @@ impl FragmentOp for VertexMeasureOp {
                 Lifecycle::DeleteOnExit,
                 Coverage::EveryBlock,
             ),
-            FragmentOutput::new(PAIRS_STREAM, Lifecycle::DeleteOnExit, Coverage::EveryBlock),
+            FragmentOutput::new(COUNT_STREAM, Lifecycle::DeleteOnExit, Coverage::EveryBlock),
         ]
     }
 
@@ -250,6 +305,10 @@ impl FragmentOp for VertexMeasureOp {
                 Source::Bit(_) => None,
             })
             .collect()
+    }
+
+    fn cost_per_voxel(&self) -> f64 {
+        MEASURE_COST
     }
 
     fn seam_fold(&self) -> Option<SeamFold> {
@@ -324,8 +383,22 @@ impl FragmentOp for VertexMeasureOp {
                         for value in point {
                             bytes.extend_from_slice(&value.to_le_bytes());
                         }
-                        let stop = stopped.map_or(-1i64, |index| index as i64);
-                        bytes.extend_from_slice(&stop.to_le_bytes());
+                        bytes.extend_from_slice(&Stops::encode(stopped)?.to_le_bytes());
+                        let mut later = 0u16;
+                        'steps: for (bit, step) in self.steps.iter().enumerate() {
+                            let mut local = [0usize; 3];
+                            for axis in 0..3 {
+                                let moved = [z, y, x][axis] as isize + step[axis];
+                                if moved < 0 || moved >= volume[axis] as isize {
+                                    continue 'steps;
+                                }
+                                local[axis] = moved as usize - origin[axis];
+                            }
+                            if skeleton[local] {
+                                later |= 1 << bit;
+                            }
+                        }
+                        bytes.extend_from_slice(&later.to_le_bytes());
                         for (window, signal) in windows.iter().zip(&self.signals) {
                             let reach = search_radius(units, self.spacing, signal.shift_um);
                             let value = self.ball.reduce_at(
@@ -347,26 +420,50 @@ impl FragmentOp for VertexMeasureOp {
         for plane in planes {
             rows.extend_from_slice(&plane);
         }
-        let pairs =
-            encode_adjacent_pairs(skeleton.view(), origin, at.core, volume, self.connectivity)?;
-        Ok(BlockOutput::fragment(MEASURE_STREAM, rows).with_fragment(PAIRS_STREAM, pairs))
+        let count = ((rows.len() - MEASURE_MAGIC.len()) / self.row_bytes()) as u64;
+        Ok(BlockOutput::fragment(MEASURE_STREAM, rows)
+            .with_fragment(COUNT_STREAM, count.to_le_bytes().to_vec()))
     }
 }
 
 /// The rows of a finished run, in vertex (lexicographic) order.
 struct Measured {
-    coordinates: Vec<[usize; 3]>,
-    stops: Vec<Option<usize>>,
-    /// One column per signal.
-    values: Vec<Vec<f64>>,
+    coordinates: Vec<[u32; 3]>,
+    /// [`Stops::encode`]d.
+    stops: Vec<u32>,
+    /// A bit per later neighbour that is skeleton too.
+    later: Vec<u16>,
+    /// One column per signal, each in the store its source's type fits.
+    values: Vec<Values>,
 }
 
-fn collect_measured(env: &dyn Environment, signals: usize) -> Result<Measured> {
-    let row_bytes = 12 + 8 + 8 * signals;
-    // Every row's bytes, as the blocks wrote them, and per row its position
-    // packed into one sortable key.
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut keys: Vec<(u64, u32)> = Vec::new();
+/// How many vertex rows the blocks wrote.
+fn count_measured(env: &dyn Environment) -> Result<usize> {
+    let mut total = 0u64;
+    fold_fragments(env, COUNT_STREAM, &mut |_key, fragment| {
+        let count: [u8; 8] = fragment
+            .try_into()
+            .map_err(|_| Error::invalid("vertex measure: a count of the wrong shape"))?;
+        total += u64::from_le_bytes(count);
+        Ok(())
+    })?;
+    usize::try_from(total).map_err(|_| Error::invalid("vertex measure: too many vertices"))
+}
+
+/// The `rows` vertex rows of every block, decoded into compact columns and
+/// put in vertex order. `stores` names each signal's store.
+fn collect_measured(env: &dyn Environment, rows: usize, stores: &[Narrow]) -> Result<Measured> {
+    let row_bytes = ROW_HEAD + 8 * stores.len();
+    // Per row, its position packed into one sortable key and its index in
+    // arrival order; the columns in arrival order. Sized once: a vector grown
+    // by doubling can hold twice what it needs.
+    let mut keys: Vec<(u64, u32)> = Vec::with_capacity(rows);
+    let mut stops: Vec<u32> = Vec::with_capacity(rows);
+    let mut later: Vec<u16> = Vec::with_capacity(rows);
+    let mut values: Vec<Values> = stores
+        .iter()
+        .map(|store| Values::with_capacity(*store, rows))
+        .collect();
     fold_fragments(env, MEASURE_STREAM, &mut |_key, fragment| {
         let body = fragment
             .strip_prefix(MEASURE_MAGIC)
@@ -379,32 +476,49 @@ fn collect_measured(env: &dyn Environment, signals: usize) -> Result<Measured> {
             let index = u32::try_from(keys.len())
                 .map_err(|_| Error::invalid("vertex measure: more than 2^32 vertices"))?;
             keys.push((key, index));
+            stops.push(u32_at(12));
+            later.push(u16::from_le_bytes(row[16..18].try_into().expect("2")));
+            for (k, column) in values.iter_mut().enumerate() {
+                let at = ROW_HEAD + 8 * k;
+                column.push(f64::from_le_bytes(row[at..at + 8].try_into().expect("8")))?;
+            }
         }
-        bytes.extend_from_slice(body);
         Ok(())
     })?;
+    if keys.len() != rows {
+        return Err(Error::invalid(format!(
+            "vertex measure: {} rows read and {rows} counted",
+            keys.len()
+        )));
+    }
     // Positions are distinct (one row per skeleton voxel), so the key alone
     // orders the rows.
     keys.sort_unstable();
-    let mut out = Measured {
-        coordinates: Vec::with_capacity(keys.len()),
-        stops: Vec::with_capacity(keys.len()),
-        values: vec![Vec::with_capacity(keys.len()); signals],
-    };
-    for (_, index) in keys {
-        let row = &bytes[index as usize * row_bytes..(index as usize + 1) * row_bytes];
-        let u32_at = |at: usize| u32::from_le_bytes(row[at..at + 4].try_into().expect("4"));
-        out.coordinates
-            .push([u32_at(0) as usize, u32_at(4) as usize, u32_at(8) as usize]);
-        let stop = i64::from_le_bytes(row[12..20].try_into().expect("8"));
-        out.stops.push((stop >= 0).then_some(stop as usize));
-        for (k, column) in out.values.iter_mut().enumerate() {
-            column.push(f64::from_le_bytes(
-                row[20 + 8 * k..28 + 8 * k].try_into().expect("8"),
-            ));
-        }
-    }
-    Ok(out)
+    let mask = (1u64 << 21) - 1;
+    let coordinates = keys
+        .iter()
+        .map(|(key, _)| {
+            [
+                (key >> 42) as u32,
+                ((key >> 21) & mask) as u32,
+                (key & mask) as u32,
+            ]
+        })
+        .collect();
+    let order: Vec<u32> = keys.iter().map(|(_, index)| *index).collect();
+    drop(keys);
+    let stops = order.iter().map(|at| stops[*at as usize]).collect();
+    let later = order.iter().map(|at| later[*at as usize]).collect();
+    let values = values
+        .into_iter()
+        .map(|column| column.gather(1, &order))
+        .collect();
+    Ok(Measured {
+        coordinates,
+        stops,
+        later,
+        values,
+    })
 }
 
 /// Hand the heap the plans freed back to the system, so that the resident
@@ -444,16 +558,116 @@ fn run(
     Ok(())
 }
 
+/// The vertex measure's block where none is given: measured fastest on the
+/// osf-sa3x8 crop and region, with the lowest peak.
+pub const MEASURE_BLOCK: [usize; 3] = [128, 256, 256];
+
+/// The pack's block where none is given: the published labels' chunk, so
+/// that each label chunk is read once.
+pub const PACK_BLOCK: [usize; 3] = [64, 64, 128];
+
+/// The plan `build` makes on `given`, else on `default` where one block of
+/// it fits the memory budget, else on the grid the planner prices fastest
+/// under the budget (`blockflow::strategy::choose_grid`).
+///
+/// The planner's choice is not the default because its model cannot price
+/// these two phases yet: the vertex measure works through its block on every
+/// worker (a plane each), which the model does not know, so it plans one
+/// block per worker and holds that many halo windows (on the osf-sa3x8
+/// region 2.9 GB at 24 s, where the default holds 1.8 GB at 21 s); and the
+/// pack is bound by decoding the labels, which the model counts as one read
+/// channel. Under a cap too small for one default block it is the planner's
+/// grid that runs.
+fn planned<T>(
+    what: &str,
+    volume: [usize; 3],
+    given: Option<[usize; 3]>,
+    default: [usize; 3],
+    workers: usize,
+    mut build: impl FnMut(BlockGrid) -> Result<(Assembly, T)>,
+) -> Result<(Assembly, T)> {
+    let host = Host::detect().with_workers(workers.max(1));
+    let block = given.unwrap_or(default);
+    let grid = BlockGrid::new(volume, block)?;
+    let (assembly, built) = build(grid.clone())?;
+    let needed = expected_bytes_per_block(&assembly.workflow.chain, &assembly.decomposition)
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    if given.is_some() || needed <= host.budget_bytes {
+        eprintln!(
+            "{what}: block {:?} ({}), {} blocks, {} MiB a block of {} MiB",
+            grid.block(),
+            if given.is_some() { "given" } else { "default" },
+            grid.n_blocks(),
+            needed >> 20,
+            host.budget_bytes >> 20
+        );
+        return Ok((assembly, built));
+    }
+    drop((assembly, built));
+    let started = Instant::now();
+    let chosen = choose_grid(volume, &host, &CostModel::default(), build)?;
+    let widest = chosen
+        .active
+        .iter()
+        .map(|set| set.bytes())
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "{what}: block {:?}, {} blocks, chosen of {} grids for {} workers ({:.2}s), the \
+         default's {} MiB a block being over the budget; active set at most {} MiB of {} MiB",
+        chosen.grid.block(),
+        chosen.grid.n_blocks(),
+        chosen.considered.len(),
+        host.workers,
+        started.elapsed().as_secs_f64(),
+        needed >> 20,
+        widest >> 20,
+        host.budget_bytes >> 20
+    );
+    Ok((chosen.assembly, chosen.built))
+}
+
+/// Lease `bytes` of the process's memory budget for `what`, which stays
+/// resident until the lease is dropped. Under a stated or cgroup cap a lease
+/// that does not fit is refused, naming the cap that would hold it; under the
+/// machine's own share it is let through with a warning.
+pub fn lease_resident(bytes: u64, what: &str) -> Result<Option<Lease>> {
+    let budget = process_budget();
+    if let Some(lease) = budget.try_acquire_reclaiming(bytes) {
+        return Ok(Some(lease));
+    }
+    let cap = process_cap();
+    let held = budget.reserved_in_use();
+    let needed = MemoryCap::needed_for(held.saturating_add(bytes));
+    let message = format!(
+        "{what} needs about {} MiB resident, and the memory cap ({cap}) leaves {} MiB beside \
+         the {} MiB already held; a cap of about {} MiB holds it.",
+        bytes.div_ceil(1 << 20),
+        budget.free() >> 20,
+        held >> 20,
+        needed.div_ceil(1 << 20)
+    );
+    if cap.is_binding() {
+        return Err(Error::invalid(message));
+    }
+    eprintln!("graph: warning: {message}");
+    Ok(None)
+}
+
 /// Stages 1–3 over stored volumes: the raw graph and the columns
 /// [`super::vessel_graph`] carries (radii, then `artery_raw`, `vein_raw`,
 /// `artery_binary`, `vein_binary` where given), with the answers the resident
-/// stages give.
+/// stages give; and the lease of the graph's resident bytes
+/// ([`PlanParams::resident_bytes_per_vertex`]), taken once the vertices are
+/// counted and before they are read.
 pub fn measure_stored(
     inputs: &StoredInputs,
     params: &GraphParams,
     build: &BuildParams,
     plan: &PlanParams,
-) -> Result<(RawGraph, Vec<Carried>)> {
+) -> Result<(RawGraph, Vec<Carried>, Option<Lease>)> {
     let (vessels_dtype, volume) = inputs.vessels.metadata()?;
     let check = |image: &AttachedImage, what: &str| -> Result<Dtype> {
         let (dtype, shape) = image.metadata()?;
@@ -514,7 +728,11 @@ pub fn measure_stored(
             source,
             shift_um: shift_um(spacing, shift_vx)?,
         });
-        names.push((name, mask_bit.is_some()));
+        let store = match mask_bit {
+            Some(_) => Narrow::Flags,
+            None => Narrow::of_dtype(dtype),
+        };
+        names.push((name, mask_bit.is_some(), store));
     }
     if plan.work.exists() {
         std::fs::remove_dir_all(&plan.work).map_err(Error::backend)?;
@@ -522,35 +740,40 @@ pub fn measure_stored(
 
     // The pack, with no chunk cache: every label chunk is read once.
     GRAPH.stage("graph plan: pack");
-    let mut builder = PlanBuilder::new(
+    let (assembly, packed) = planned(
+        "graph pack",
         volume,
-        vessels_dtype,
-        BlockGrid::new(volume, plan.pack_block)?,
-    );
-    let packed = builder
-        .pixels(Chain::op(PackMasksOp {
-            sources: packed_sources,
-        }))?
-        .image()?;
-    let assembly = builder.finish()?;
+        plan.pack_block,
+        PACK_BLOCK,
+        plan.workers,
+        |grid| {
+            let mut builder = PlanBuilder::new(volume, vessels_dtype, grid);
+            let packed = builder
+                .pixels(Chain::op(PackMasksOp {
+                    sources: packed_sources.clone(),
+                }))?
+                .image()?;
+            Ok((builder.finish()?, packed))
+        },
+    )?;
     let pack_work = plan.work.join("pack");
     let env = ZarrEnvironment::attach(&pack_work, &masks)?.without_cache();
     run(&assembly, &env, plan, &[packed], "graph pack")?;
-    drop(env);
+    drop((env, assembly));
 
     // The vertex measure over the packed masks and the channels.
     GRAPH.stage("graph plan: measure");
-    let search = RadiusSearch::new(params.radius.clone())?;
+    let search = Arc::new(RadiusSearch::new(params.radius.clone())?);
     // The window reach: the walk's maximum, or the widest ball any signal
     // can be read over (the search radius of the longest stop), if larger;
-    // at least one, for the pairs.
+    // at least one, for the neighbours.
     let longest: [f64; 3] =
         std::array::from_fn(|axis| params.radius.max_radius[axis] as f64 * spacing[axis]);
     let largest = signals
         .iter()
         .map(|signal| search_radius(longest, spacing, signal.shift_um))
         .fold(0.0f64, f64::max);
-    let ball = Ball::new(largest)?;
+    let ball = Arc::new(Ball::new(largest)?);
     let reach = params
         .radius
         .max_radius
@@ -560,16 +783,32 @@ pub fn measure_stored(
         .unwrap_or(0)
         .max(ball.radius())
         .max(1);
-    let mut builder = PlanBuilder::new(volume, Dtype::U8, BlockGrid::new(volume, plan.block)?);
-    let measure = builder.fragments(VertexMeasureOp {
-        signals: signals.clone(),
-        search: search.clone(),
-        ball,
-        spacing,
-        reach,
-        connectivity: build.connectivity,
-    })?;
-    let assembly = builder.finish()?;
+    let steps = forward_offsets(build.connectivity);
+    if steps.len() > 16 {
+        return Err(Error::invalid(format!(
+            "{} later neighbours do not fit the 16 bits a vertex row holds.",
+            steps.len()
+        )));
+    }
+    let (assembly, ()) = planned(
+        "graph measure",
+        volume,
+        plan.block,
+        MEASURE_BLOCK,
+        plan.workers,
+        |grid| {
+            let mut builder = PlanBuilder::new(volume, Dtype::U8, grid);
+            builder.fragments(VertexMeasureOp {
+                signals: signals.clone(),
+                search: Arc::clone(&search),
+                ball: Arc::clone(&ball),
+                spacing,
+                reach,
+                steps: steps.clone(),
+            })?;
+            Ok((builder.finish()?, ()))
+        },
+    )?;
     let mut attached = vec![AttachedImage::at(
         pack_work.join(format!("level{}", packed.index())),
     )];
@@ -577,28 +816,45 @@ pub fn measure_stored(
     let env =
         ZarrEnvironment::attach(plan.work.join("measure"), &attached)?.with_cache(plan.cache_bytes);
     run(&assembly, &env, plan, &[], "graph measure")?;
+    drop((assembly, ball));
+    release_freed_memory();
+
     GRAPH.stage("graph plan: collect");
-    let measured = collect_measured(&env, signals.len())?;
-    let pairs = collect_pairs(&env, PAIRS_STREAM, measure.index(), volume)?;
+    let rows = count_measured(&env)?;
+    let lease = match plan.resident_bytes_per_vertex {
+        0 => None,
+        per_vertex => lease_resident(
+            (rows as u64).saturating_mul(per_vertex),
+            &format!(
+                "the vessel graph of {rows} raw vertices ({per_vertex} bytes a raw vertex at \
+                 its widest)"
+            ),
+        )?,
+    };
+    let stores: Vec<Narrow> = names.iter().map(|(_, _, store)| *store).collect();
+    let measured = collect_measured(&env, rows, &stores)?;
     drop(env);
     let _ = std::fs::remove_dir_all(&plan.work);
     release_freed_memory();
 
     GRAPH.stage("graph plan: raw graph");
-    let raw = RawGraph::assemble(volume, &measured.coordinates, &pairs)?;
-    let mut carried = Vec::new();
-    let radii = search.from_stops(&measured.stops, spacing)?;
-    for (name, column) in radii.columns() {
-        carried.push(Carried::max(name, column));
-    }
-    for ((name, mask), values) in names.into_iter().zip(measured.values) {
+    let Measured {
+        coordinates,
+        stops,
+        later,
+        values,
+    } = measured;
+    let raw = RawGraph::from_steps(volume, coordinates, &steps, &later)?;
+    drop(later);
+    let search = Arc::try_unwrap(search).unwrap_or_else(|shared| (*shared).clone());
+    let mut carried = carried_stops(Arc::new(search), stops, spacing)?;
+    for ((name, mask, _), values) in names.into_iter().zip(values) {
+        let column = RawColumn::dense(1, values)?;
         carried.push(match mask {
-            false => Carried::max(name, Column::scalar(values)),
-            true => {
-                let flags: Vec<bool> = values.iter().map(|value| *value != 0.0).collect();
-                Carried::binary(name, Column::flags(&flags))
-            }
+            false => Carried::max(name, column),
+            // A mask's maximum over a ball of its bit is 0 or 1 already.
+            true => Carried::binary(name, column),
         });
     }
-    Ok((raw, carried))
+    Ok((raw, carried, lease))
 }

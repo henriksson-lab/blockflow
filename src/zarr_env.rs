@@ -1830,7 +1830,24 @@ impl ZarrEnvironment {
     }
 
     /// [`Self::build_multiscale`], with an explicit compression policy.
+    ///
+    /// Written by a [`MultiscaleWriter`] in slabs of whole level-0 chunk rows:
+    /// each level is built from the rows handed to the one above, chunks are
+    /// encoded in parallel as the cap allows, and no level is read back.
     pub fn build_multiscale_with_compression(
+        root: impl Into<PathBuf>,
+        input: &Voxels,
+        spec: &PyramidSpec,
+        compression: CompressionPolicy,
+    ) -> Result<MultiscaleImage> {
+        multiscale::write_resident(&root.into(), input, spec, &compression)
+    }
+
+    /// The builder [`MultiscaleWriter`] replaced, kept as the reference its
+    /// bytes are checked against: one chunk at a time, each level re-read from
+    /// the store to build the next.
+    #[cfg(test)]
+    pub(crate) fn build_multiscale_reference(
         root: impl Into<PathBuf>,
         input: &Voxels,
         spec: &PyramidSpec,
@@ -1843,7 +1860,7 @@ impl ZarrEnvironment {
         let mut shape = input.shape();
         let mut chunk = spec
             .chunk
-            .unwrap_or_else(|| chunk_for_block(shape, input.dtype()));
+            .unwrap_or_else(|| chunk_for_extent(shape, input.dtype()));
         let image0 = StoredArray::create(
             &store,
             "/0",
@@ -1868,7 +1885,7 @@ impl ZarrEnvironment {
             let next_shape = downsampled_shape(shape, factor, index + 1)?;
             chunk = spec
                 .chunk
-                .unwrap_or_else(|| chunk_for_block(next_shape, input.dtype()));
+                .unwrap_or_else(|| chunk_for_extent(next_shape, input.dtype()));
             let next = StoredArray::create(
                 &store,
                 &format!("/{}", index + 1),
@@ -2485,7 +2502,7 @@ impl ZarrEnvironment {
         chunks.push(self.input_chunk);
         for image in 1..decomposition.n_images() {
             let phase = &decomposition.phases[image - 1];
-            let derived = chunk_for_block(phase.grid.block(), decomposition.dtype_at(image));
+            let derived = chunk_for_grid(&phase.grid, decomposition.dtype_at(image));
             chunks.push(match decomposition.image_visibility(image) {
                 // Nobody outside the run reads it, so its layout is ours and the
                 // invariant is free.
@@ -2738,8 +2755,8 @@ impl ZarrEnvironment {
             return err;
         }
         let mut derived = chunks.to_vec();
-        derived[output] = chunk_for_block(
-            decomposition.phases[output - 1].grid.block(),
+        derived[output] = chunk_for_grid(
+            &decomposition.phases[output - 1].grid,
             decomposition.dtype_at(output),
         );
         if check_chunk_exclusive_writes(decomposition, &derived).is_err() {
@@ -2832,6 +2849,7 @@ fn downsampled_shape(shape: [usize; 3], factor: [usize; 3], level: usize) -> Res
     Ok(out)
 }
 
+#[cfg(test)]
 fn write_downsampled_level(
     source: &StoredArray,
     target: &StoredArray,
@@ -2854,6 +2872,7 @@ fn write_downsampled_level(
     })
 }
 
+#[cfg(test)]
 fn chunk_regions(shape: &[usize], chunk: &[usize]) -> Vec<Region> {
     let mut regions = Vec::new();
     let mut z = 0;
@@ -2875,6 +2894,7 @@ fn chunk_regions(shape: &[usize], chunk: &[usize]) -> Vec<Region> {
     regions
 }
 
+#[cfg(test)]
 fn source_region_for_decimation(target: &Region, factor: [usize; 3]) -> Region {
     Region::new(
         &[
@@ -3031,6 +3051,37 @@ const MIN_CHUNK_BYTES: u128 = 256 << 10;
 /// of them costs to move, so a rule stated in voxels would be calibrated for one
 /// element type and wrong for the other ten.
 pub fn chunk_for_block(block: [usize; 3], dtype: Dtype) -> [usize; 3] {
+    reduce_chunk(block, dtype, [false; 3])
+}
+
+/// The chunk shape for a **whole array** of `shape`: [`chunk_for_block`]'s
+/// rule, except that a prime extent is halved (rounding up) rather than cut
+/// to one voxel or left whole.
+///
+/// A block's chunk must divide the block, so a prime block extent has only
+/// itself and 1 to offer; an array written whole has no such constraint (its
+/// last chunk along an axis may be partial), and a one-voxel axis there is a
+/// chunk of one row — `[281, 1, 570]` for a `[1686, 1839, 570]` volume —
+/// which every plane read then crosses a thousand times over — or, where one
+/// voxel would fall under the byte floor, a prime axis left whole and a chunk
+/// far over the ceiling (`[521, 181, 163]`, 30 MB). Only the step that would
+/// have gone to one changes, so any extent without a large prime factor is
+/// chunked exactly as [`chunk_for_block`] chunks it.
+pub fn chunk_for_extent(shape: [usize; 3], dtype: Dtype) -> [usize; 3] {
+    reduce_chunk(shape, dtype, [true; 3])
+}
+
+/// The chunk shape for an image written by blocks of `grid`: an axis the grid
+/// does not cut is chunked as [`chunk_for_extent`] chunks it, since no block
+/// boundary crosses it, and every other axis as [`chunk_for_block`].
+pub fn chunk_for_grid(grid: &crate::geometry::BlockGrid, dtype: Dtype) -> [usize; 3] {
+    let counts = grid.blocks_per_axis();
+    reduce_chunk(grid.block(), dtype, std::array::from_fn(|a| counts[a] <= 1))
+}
+
+/// The reduction behind [`chunk_for_block`]; on a `free` axis a step to one
+/// voxel halves instead (rounding up).
+fn reduce_chunk(block: [usize; 3], dtype: Dtype, free: [bool; 3]) -> [usize; 3] {
     let element = dtype.size_of().max(1) as u128;
     let bytes =
         |chunk: &[usize; 3]| chunk.iter().map(|&edge| edge as u128).product::<u128>() * element;
@@ -3046,7 +3097,11 @@ pub fn chunk_for_block(block: [usize; 3], dtype: Dtype) -> [usize; 3] {
                 continue;
             }
             let mut candidate = chunk;
-            candidate[axis] = smaller;
+            candidate[axis] = if smaller == 1 && free[axis] {
+                chunk[axis].div_ceil(2)
+            } else {
+                smaller
+            };
             if bytes(&candidate) < MIN_CHUNK_BYTES {
                 continue;
             }
@@ -3653,6 +3708,9 @@ impl Environment for ZarrEnvironment {
     }
 }
 
+mod multiscale;
+pub use multiscale::{level_chunk, slab_rows_under, sweep_axis, MultiscaleWriter, PyramidElement};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4111,6 +4169,51 @@ mod tests {
         assert_eq!(chunk_for_block([7, 7, 7], Dtype::F64), [7, 7, 7]);
     }
 
+    /// A whole array never gets a one-voxel axis from a prime extent; an
+    /// extent without one is chunked as a block of it would be.
+    #[test]
+    fn a_whole_array_halves_a_prime_extent_instead_of_cutting_it_to_one_row() {
+        // 1839 = 3 x 613: the block rule takes 613 to 1, a chunk of one row.
+        assert_eq!(
+            chunk_for_block([1686, 1839, 570], Dtype::U16),
+            [281, 1, 570]
+        );
+        let whole = chunk_for_extent([1686, 1839, 570], Dtype::U16);
+        assert!(whole.iter().all(|&edge| edge > 1), "{whole:?}");
+        // And a prime axis is not left whole when one voxel is under the
+        // floor: the chunk ends inside the byte range.
+        let bytes = |chunk: [usize; 3]| chunk.iter().product::<usize>() * 2;
+        assert_eq!(
+            chunk_for_block([521, 1810, 1141], Dtype::U16),
+            [521, 181, 163]
+        );
+        let whole = chunk_for_extent([521, 1810, 1141], Dtype::U16);
+        assert!(bytes(whole) as u128 <= MAX_CHUNK_BYTES, "{whole:?}");
+        // Extents without a large prime factor are chunked as blocks are.
+        for (shape, dtype) in [
+            ([512, 640, 640], Dtype::U16),
+            ([512, 512, 512], Dtype::F64),
+            ([400, 1200, 900], Dtype::F32),
+        ] {
+            assert_eq!(
+                chunk_for_extent(shape, dtype),
+                chunk_for_block(shape, dtype),
+                "{shape:?}"
+            );
+        }
+        // A grid that does not cut an axis leaves it free; one that does keeps
+        // the chunk a divisor of the block.
+        use crate::geometry::BlockGrid;
+        let uncut = BlockGrid::new([1686, 1839, 570], [64, 1839, 570]).unwrap();
+        let chunk = chunk_for_grid(&uncut, Dtype::U16);
+        assert!(
+            chunk.iter().all(|&edge| edge > 1) && 64 % chunk[0] == 0,
+            "{chunk:?}"
+        );
+        let cut = BlockGrid::new([1686, 3678, 570], [1686, 1839, 570]).unwrap();
+        assert_eq!(chunk_for_grid(&cut, Dtype::U16), [281, 1, 570]);
+    }
+
     /// An image's chunking follows the phase that writes it; image 0 keeps
     /// whatever the caller's array already had; and a dictated output layout is
     /// heard only for the output.
@@ -4423,3 +4526,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+mod tile_writer;
+pub use tile_writer::TileWriter;
+
+mod block_decimation;
+pub use block_decimation::downsample_block;

@@ -408,10 +408,11 @@ impl MemoryBudget {
     /// granted from the free bytes, after asking the opportunistic holders for
     /// whatever is missing, and refused (`None`) if that is still not enough.
     ///
-    /// The executor's admission call. It runs blocks in waves and holds no
-    /// compute lease of its own while it forms one, so waiting could only be
-    /// waiting on a cache — which is what the reclaim is for — or on another
-    /// executor sharing the budget, which may hold its leases for a whole wave.
+    /// The executor's admission call. It admits blocks from one thread as room
+    /// frees and must not block there — a block that does not fit waits for
+    /// one in flight to finish — so waiting could only be waiting on a cache,
+    /// which is what the reclaim is for, or on another executor sharing the
+    /// budget, whose blocks return their leases as they finish.
     pub fn try_acquire_reclaiming(&self, bytes: u64) -> Option<Lease> {
         if let Some(lease) = self.try_acquire(bytes) {
             return Some(lease);
@@ -1032,6 +1033,7 @@ pub fn release_freed_heap() {
 /// cap is executing, and stops when dropped.
 pub struct ResidentSampler {
     peak: Arc<AtomicU64>,
+    latest: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -1044,9 +1046,11 @@ impl ResidentSampler {
     pub fn start() -> Option<Self> {
         let first = resident_bytes()?;
         let peak = Arc::new(AtomicU64::new(first));
+        let latest = Arc::new(AtomicU64::new(first));
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
             let peak = Arc::clone(&peak);
+            let latest = Arc::clone(&latest);
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("blockflow-rss".into())
@@ -1054,6 +1058,7 @@ impl ResidentSampler {
                     while !stop.load(Ordering::Relaxed) {
                         if let Some(now) = resident_bytes() {
                             peak.fetch_max(now, Ordering::Relaxed);
+                            latest.store(now, Ordering::Relaxed);
                         }
                         std::thread::sleep(SAMPLE_INTERVAL);
                     }
@@ -1062,9 +1067,16 @@ impl ResidentSampler {
         };
         Some(Self {
             peak,
+            latest,
             stop,
             handle: Some(handle),
         })
+    }
+
+    /// The resident set at the last sample, at most [`SAMPLE_INTERVAL`] old:
+    /// free to ask, where [`Self::peak`] reads the resident set itself.
+    pub fn latest(&self) -> u64 {
+        self.latest.load(Ordering::Relaxed)
     }
 
     /// Start a new window at `now`.

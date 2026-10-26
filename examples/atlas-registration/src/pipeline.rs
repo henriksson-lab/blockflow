@@ -13,6 +13,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use blockflow::budget::Lease;
 use blockflow::error::{Error, Result};
 use blockflow::ops::TransformInterpolation;
 use blockflow::voxels::Voxels;
@@ -24,12 +25,14 @@ use crate::compute::{
     point_transform, transform_text, with_initial, FitConvergence, SpatialFrame, TransformModel,
     VolumeFitParams,
 };
+use crate::memory;
+use crate::place::{search_translation, Placement, SearchParams};
 use crate::rescale::{Frame, Rescale};
 use crate::similarity::{similarity, Similarity};
 use crate::stochastic::{
     fit_stochastic, AffineMap, StochasticFitParams, StochasticInitialisation, StochasticLevelReport,
 };
-use crate::volume::{lattice_over, warp, write_image, Volume};
+use crate::volume::{lattice_over, warp, warp_scratch_bytes, write_image, Volume};
 use crate::{AtlasTransform, ElastixTransform, PointSpace, RegisterParams};
 
 /// The sidecar `register` writes beside the transform files.
@@ -83,7 +86,9 @@ pub struct RegisterConfig {
 /// "GeometricalCenter"`; `Translation` is the physical frames with an initial
 /// translation, as elastix's `-t0` with a translation file, except that the
 /// translation is the first stage's starting value rather than a separate
-/// transform (so it is fitted with it, and written into its file).
+/// transform (so it is fitted with it, and written into its file). `Search`
+/// finds that translation from the images (`place`), for a part of a mosaic
+/// whose frames do not place it; elastix has no equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Initialisation {
     #[default]
@@ -93,17 +98,21 @@ pub enum Initialisation {
     /// `[z, y, x]` in the images' physical unit: the fixed image's point `p`
     /// starts at the moving image's point `p + t`.
     Translation([f64; 3]),
+    /// The translation `place::search_translation` finds on the two
+    /// registration lattices, then as `Translation`.
+    Search(SearchParams),
 }
 
 impl Initialisation {
-    /// `parameters`, `physical`, `centre` (or `center`).
+    /// `parameters`, `physical`, `centre` (or `center`), `search`.
     pub fn parse(text: &str) -> Result<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
             "parameters" | "file" => Ok(Self::Parameters),
             "physical" | "origins" => Ok(Self::Physical),
             "centre" | "center" | "geometricalcenter" => Ok(Self::Centre),
+            "search" => Ok(Self::Search(SearchParams::default())),
             other => Err(Error::invalid(format!(
-                "initialisation `{other}`: parameters, physical or centre"
+                "initialisation `{other}`: parameters, physical, centre or search"
             ))),
         }
     }
@@ -115,6 +124,7 @@ impl Initialisation {
             Self::Physical => json!("physical"),
             Self::Centre => json!("centre"),
             Self::Translation(t) => json!({ "translation": t }),
+            Self::Search(_) => json!("search"),
         }
     }
 
@@ -136,6 +146,9 @@ impl Initialisation {
                 params.initialisation = StochasticInitialisation::GeometricCentre;
                 Ok(None)
             }
+            Self::Search(_) => Err(Error::invalid(
+                "a placement search is resolved to a translation before the fit",
+            )),
             Self::Translation(t) => {
                 params.initialisation = StochasticInitialisation::Identity;
                 let voxels: [f64; 3] = std::array::from_fn(|a| t[a] / spacing[a]);
@@ -267,7 +280,16 @@ fn register_native(config: &RegisterConfig, native: &[VolumeFitParams]) -> Resul
 
     fs::create_dir_all(&config.out).map_err(Error::backend)?;
     let work = config.out.join("work");
+    // Both lattices are held in float64 through every stage; each is sampled
+    // by a planned phase (which leases its own blocks) into an image that is
+    // then widened.
+    let voxels = memory::voxels(lattice_shape);
+    let _lattices = memory::lease(
+        16 * voxels,
+        &format!("the registration lattices ({lattice_shape:?}, float64)"),
+    )?;
     let sample = |volume: &Volume, level: usize, name: &str| -> Result<Array3<f64>> {
+        let _sampled = memory::lease(8 * voxels, &format!("the {name} image sampled"))?;
         Ok(volume
             .sample_onto(
                 level,
@@ -293,6 +315,12 @@ fn register_native(config: &RegisterConfig, native: &[VolumeFitParams]) -> Resul
     let mut stages = Vec::new();
     for params in native {
         let params = params.clone().with_geometry(frame.clone());
+        // The stage's moving image, and the resident fit's copies of both.
+        let copies = if params.pyramid.is_some() { 3 } else { 1 };
+        let _stage = memory::lease(
+            8 * copies * voxels,
+            "the stage's moving image and the fit's copies",
+        )?;
         // Each stage fits the moving image as warped by the stages before it,
         // resampled once from the original rather than stage by stage.
         let current = if chain.is_empty() {
@@ -453,28 +481,6 @@ fn register_stochastic(
 ) -> Result<RegisterSummary> {
     let fixed = Volume::open(&config.fixed.path, config.fixed.channel)?;
     let moving = Volume::open(&config.moving.path, config.moving.channel)?;
-    let fixed_level = match (config.fixed.level, config.resolution) {
-        (Some(level), _) => level,
-        (None, Some(spacing)) => fixed.level_for(spacing),
-        (None, None) => 0,
-    };
-    check_level(&fixed, fixed_level, "fixed")?;
-    let spacing = config
-        .resolution
-        .unwrap_or_else(|| fixed.frame(fixed_level).scale);
-    let (lattice, lattice_shape) =
-        lattice_over(&fixed.frame(fixed_level), fixed.shape(fixed_level), spacing)?;
-    let moving_level = config
-        .moving
-        .level
-        .unwrap_or_else(|| moving.level_for(spacing));
-    check_level(&moving, moving_level, "moving")?;
-    let (moving_lattice, moving_shape) = lattice_over(
-        &moving.frame(moving_level),
-        moving.shape(moving_level),
-        spacing,
-    )?;
-
     fs::create_dir_all(&config.out).map_err(Error::backend)?;
     let mut timings = serde_json::Map::new();
     let mut clock = std::time::Instant::now();
@@ -482,29 +488,57 @@ fn register_stochastic(
         timings.insert(name.to_string(), json!(clock.elapsed().as_secs_f64()));
         clock = std::time::Instant::now();
     };
-    // At registration resolution both images fit in memory, so the level is
-    // read whole and resampled resident (in parallel slabs); a lattice that is
-    // the level itself is used as read.
-    let sample = |volume: &Volume, level: usize, frame: &Frame, shape: [usize; 3]| {
-        let source = volume.read(level)?.widened();
-        if volume.frame(level) == *frame && volume.shape(level) == shape {
-            return Ok(source);
-        }
-        let identity = |p: [f64; 3]| p;
-        warp(
-            &source,
-            &volume.frame(level),
-            frame,
-            shape,
-            &identity,
-            TransformInterpolation::Linear,
-        )
-    };
-    let fixed_lattice = sample(&fixed, fixed_level, &lattice, lattice_shape)?;
-    let moving_lattice_image = sample(&moving, moving_level, &moving_lattice, moving_shape)?;
+    let Lattices {
+        fixed_level,
+        moving_level,
+        lattice,
+        lattice_shape,
+        moving_lattice,
+        moving_shape,
+        fixed_lattice,
+        moving_lattice_image,
+        lease: _lattices,
+    } = sample_lattices(
+        &fixed,
+        &moving,
+        &config.fixed,
+        &config.moving,
+        config.resolution,
+    )?;
+    // The fit's single-precision copies, held through every stage, and per
+    // level its smoothed (and prefiltered) copies of those.
+    let (fixed_voxels, moving_voxels) =
+        (memory::voxels(lattice_shape), memory::voxels(moving_shape));
+    let _single = memory::lease(
+        4 * (fixed_voxels + moving_voxels),
+        "the registration lattices in float32",
+    )?;
     let fixed_f32 = fixed_lattice.mapv(|v| v as f32);
     let moving_f32 = moving_lattice_image.mapv(|v| v as f32);
     lap("sample_s", &mut timings);
+
+    // A placement search runs on the lattices the fit uses, and starts it
+    // from the translation found.
+    let (initialisation, placement) = match config.initialisation {
+        Initialisation::Search(search) => {
+            let placement = search_translation(
+                fixed_lattice.view(),
+                &lattice,
+                moving_lattice_image.view(),
+                &moving_lattice,
+                &search,
+            )?;
+            let record = placement.to_json(&search);
+            (
+                Initialisation::Translation(placement.translation()),
+                Some(record),
+            )
+        }
+        other => (other, None),
+    };
+    if placement.is_some() {
+        lap("place_s", &mut timings);
+    }
 
     let frame = SpatialFrame::new(lattice.translation, lattice.scale, IDENTITY)?;
     let prior = lattice_map(&lattice, &moving_lattice);
@@ -524,10 +558,14 @@ fn register_stochastic(
             params.workers = config.workers;
         }
         let initial = if index == 0 {
-            config.initialisation.apply(&mut params, lattice.scale)?
+            initialisation.apply(&mut params, lattice.scale)?
         } else {
             None
         };
+        let fit_lease = memory::lease(
+            4 * (fixed_voxels + moving_voxels),
+            &format!("stage {index}'s smoothed images"),
+        )?;
         let fit = fit_stochastic(
             &params,
             fixed_f32.view(),
@@ -537,6 +575,7 @@ fn register_stochastic(
             initial,
             frame.clone(),
         )?;
+        drop(fit_lease);
         lap(&format!("stage{index}_fit_s"), &mut timings);
         let text = transform_text(&fit.transform)?;
         let text = if index == 0 {
@@ -560,7 +599,17 @@ fn register_stochastic(
             }
             TransformModel::BSpline => after_bspline = true,
         }
-        // How well the stages so far fit, on the fixed lattice.
+        // How well the stages so far fit, on the fixed lattice: the moving
+        // lattice warped onto it (and, for --warped-stages, a float32 copy of
+        // that and the pyramid written from it).
+        let stage_bytes = 8 * fixed_voxels
+            + warp_scratch_bytes(lattice_shape)
+            + if config.warped_stages {
+                4 * fixed_voxels * 8 / 7
+            } else {
+                0
+            };
+        let _similarity = memory::lease(stage_bytes, &format!("stage {index}'s warped image"))?;
         let so_far = ElastixTransform::read(&transform_file)?;
         let map = |p: [f64; 3]| so_far.apply(p, &RegisterParams::default());
         let warped = warp(
@@ -616,7 +665,10 @@ fn register_stochastic(
         "transform": transform_file.file_name().and_then(|n| n.to_str()),
         "direction": "fixed physical -> moving physical",
         "optimizer": "stochastic",
-        "initialisation": config.initialisation.to_json(),
+        "initialisation": match &placement {
+            Some(record) => json!({ "search": record }),
+            None => initialisation.to_json(),
+        },
         "timings": timings,
         "fixed": side_json(&config.fixed, &fixed, fixed_level),
         "moving": side_json(&config.moving, &moving, moving_level),
@@ -639,6 +691,116 @@ fn register_stochastic(
         transform_file,
         warped,
     })
+}
+
+/// Both images on lattices of one voxel size, each over its own box, as the
+/// stochastic fit (and the placement search) use them.
+struct Lattices {
+    fixed_level: usize,
+    moving_level: usize,
+    lattice: Frame,
+    lattice_shape: [usize; 3],
+    moving_lattice: Frame,
+    moving_shape: [usize; 3],
+    fixed_lattice: Array3<f64>,
+    moving_lattice_image: Array3<f64>,
+    /// The two lattices' bytes, leased for as long as they are held.
+    lease: Option<Lease>,
+}
+
+fn sample_lattices(
+    fixed: &Volume,
+    moving: &Volume,
+    fixed_input: &Input,
+    moving_input: &Input,
+    resolution: Option<[f64; 3]>,
+) -> Result<Lattices> {
+    let fixed_level = match (fixed_input.level, resolution) {
+        (Some(level), _) => level,
+        (None, Some(spacing)) => fixed.level_for(spacing),
+        (None, None) => 0,
+    };
+    check_level(fixed, fixed_level, "fixed")?;
+    let spacing = resolution.unwrap_or_else(|| fixed.frame(fixed_level).scale);
+    let (lattice, lattice_shape) =
+        lattice_over(&fixed.frame(fixed_level), fixed.shape(fixed_level), spacing)?;
+    let moving_level = moving_input
+        .level
+        .unwrap_or_else(|| moving.level_for(spacing));
+    check_level(moving, moving_level, "moving")?;
+    let (moving_lattice, moving_shape) = lattice_over(
+        &moving.frame(moving_level),
+        moving.shape(moving_level),
+        spacing,
+    )?;
+    // At registration resolution both images fit in memory, so the level is
+    // read whole and resampled resident (in parallel planes); a lattice that
+    // is the level itself is used as read. The lattices are leased for as
+    // long as they are held, and each side's read, as stored and widened,
+    // while it is resampled.
+    let lease = memory::lease(
+        8 * (memory::voxels(lattice_shape) + memory::voxels(moving_shape)),
+        &format!("the registration lattices ({lattice_shape:?} and {moving_shape:?}, float64)"),
+    )?;
+    let sample = |volume: &Volume, level: usize, frame: &Frame, shape: [usize; 3]| {
+        let same = volume.frame(level) == *frame && volume.shape(level) == shape;
+        let level_voxels = memory::voxels(volume.shape(level));
+        // The lattice is the widened level itself when it is used as read.
+        let widened = if same { 0 } else { 8 * level_voxels };
+        let scratch = if same { 0 } else { warp_scratch_bytes(shape) };
+        let _read = memory::lease(
+            volume.stored_bytes(level)? + widened + scratch,
+            &format!(
+                "level {level} of {:?}, read whole to be resampled",
+                volume.shape(level)
+            ),
+        )?;
+        let source = volume.read(level)?.widened();
+        if same {
+            return Ok(source);
+        }
+        let identity = |p: [f64; 3]| p;
+        warp(
+            &source,
+            &volume.frame(level),
+            frame,
+            shape,
+            &identity,
+            TransformInterpolation::Linear,
+        )
+    };
+    Ok(Lattices {
+        fixed_level,
+        moving_level,
+        lattice,
+        lattice_shape,
+        moving_lattice,
+        moving_shape,
+        fixed_lattice: sample(fixed, fixed_level, &lattice, lattice_shape)?,
+        moving_lattice_image: sample(moving, moving_level, &moving_lattice, moving_shape)?,
+        lease,
+    })
+}
+
+/// Where the fixed image lies in the moving one: the placement search on the
+/// lattices a stochastic registration at `resolution` would fit, without the
+/// fit.
+pub fn place(
+    fixed: &Input,
+    moving: &Input,
+    resolution: Option<[f64; 3]>,
+    params: &SearchParams,
+) -> Result<Placement> {
+    let fixed_volume = Volume::open(&fixed.path, fixed.channel)?;
+    let moving_volume = Volume::open(&moving.path, moving.channel)?;
+    let lattices = sample_lattices(&fixed_volume, &moving_volume, fixed, moving, resolution)?;
+    search_translation(
+        lattices.fixed_lattice.view(),
+        &lattices.lattice,
+        lattices.moving_lattice_image.view(),
+        &lattices.moving_lattice,
+        params,
+    )
 }
 
 // -------------------------------------------------------------- chains --
@@ -767,6 +929,23 @@ fn write_warped(
         }
         None => (moving, moving_level),
     };
+    // Resident while it is warped: the source as stored and widened, the
+    // warped lattice, and the image written (float32, or uint64 labels) with
+    // the pyramid built from it.
+    let stored_bytes = source.stored_bytes(level)?;
+    let source_voxels = memory::voxels(source.shape(level));
+    let lattice_voxels = memory::voxels(lattice_shape);
+    let source_lease = memory::lease(
+        stored_bytes + 8 * source_voxels,
+        &format!(
+            "level {level} of {:?}, read whole to be warped",
+            source.shape(level)
+        ),
+    )?;
+    let warped_lease = memory::lease(
+        8 * lattice_voxels + warp_scratch_bytes(lattice_shape),
+        &format!("the warped lattice of {lattice_shape:?}"),
+    )?;
     let stored = source.read(level)?;
     let integer = !matches!(stored.dtype(), Dtype::F16 | Dtype::F32 | Dtype::F64);
     let interpolation = if config.nearest {
@@ -774,19 +953,28 @@ fn write_warped(
     } else {
         TransformInterpolation::Linear
     };
+    let widened = stored.widened();
+    drop(stored);
     let warped = warp(
-        &stored.widened(),
+        &widened,
         &source.frame(level),
         lattice,
         lattice_shape,
         map,
         interpolation,
     )?;
-    let image = if config.nearest && integer {
+    drop((widened, source_lease));
+    let labels = config.nearest && integer;
+    let _image = memory::lease(
+        if labels { 8 } else { 4 } * lattice_voxels * 8 / 7,
+        &format!("the warped image of {lattice_shape:?} and its pyramid"),
+    )?;
+    let image = if labels {
         Voxels::from(warped.mapv(|v| v.max(0.0) as u64))
     } else {
         Voxels::from(warped.mapv(|v| v as f32))
     };
+    drop((warped, warped_lease));
     write_image(path, &image, lattice, source.unit().as_deref())
 }
 

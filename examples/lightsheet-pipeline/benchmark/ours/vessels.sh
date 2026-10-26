@@ -5,16 +5,17 @@
 # blockflow side of the vessel workloads: segment both channels (vessel,
 # artery) of an OME-Zarr copy, then build the vessel graph over its labels.
 #
-#   vessels.sh BIN_DIR ZARR OUT_DIR WORKERS [WEIGHTS]
+#   vessels.sh BIN_DIR ZARR OUT_DIR WORKERS [WEIGHTS [DEVICE]]
 #
 # ZARR is a fresh copy (segment writes its labels into it). With WEIGHTS (a
-# safetensors file) the deep filling runs, otherwise --no-deep-fill. Writes
-# OUT_DIR/{graph.json,stages.json}; the scratch directories are removed.
+# safetensors file) the deep filling runs, otherwise --no-deep-fill; DEVICE
+# (cpu, gpu or auto; default cpu) is where its network runs. Writes
+# OUT_DIR/{graph.json,timing.json} (timing: seconds per command).
 set -euo pipefail
-BIN="$1"; ZARR="$2"; OUT="$3"; WORKERS="$4"; WEIGHTS="${5:-}"
+BIN="$1"; ZARR="$2"; OUT="$3"; WORKERS="$4"; WEIGHTS="${5:-}"; DEVICE="${6:-cpu}"
 mkdir -p "$OUT"
 fill=(--no-deep-fill)
-[ -n "$WEIGHTS" ] && fill=(--deep-fill-weights "$WEIGHTS")
+[ -n "$WEIGHTS" ] && fill=(--deep-fill-weights "$WEIGHTS" --deep-fill-device "$DEVICE")
 t0=$(date +%s.%N)
 "$BIN/vessel-graph" segment --zarr "$ZARR" --channel 0,1 --role vessel,artery \
     --workers "$WORKERS" --work "$OUT/work-segment" "${fill[@]}"

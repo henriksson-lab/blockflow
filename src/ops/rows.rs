@@ -711,6 +711,43 @@ pub fn value_at(pixels: &Voxels, at: [usize; 3]) -> Result<f64> {
     Ok(value)
 }
 
+/// A voxel type [`value_at`] reads, as the `f64` it reads it as: a loop over
+/// many voxels of one image matches the image's type once and reads through
+/// this, rather than through [`value_at`] at every voxel, and gets the same
+/// numbers.
+pub trait ReadAsF64: Copy {
+    /// Every value of the type is finite, so no read needs the check.
+    const ALWAYS_FINITE: bool;
+    fn read_as_f64(self) -> f64;
+}
+
+macro_rules! read_as_f64 {
+    ($($type:ty => $finite:expr),* $(,)?) => {$(
+        impl ReadAsF64 for $type {
+            const ALWAYS_FINITE: bool = $finite;
+            #[inline]
+            fn read_as_f64(self) -> f64 {
+                self as f64
+            }
+        }
+    )*};
+}
+
+read_as_f64!(u8 => true, u16 => true, u32 => true, i8 => true, i16 => true, i32 => true,
+    f32 => false, f64 => false);
+
+impl ReadAsF64 for bool {
+    const ALWAYS_FINITE: bool = true;
+    #[inline]
+    fn read_as_f64(self) -> f64 {
+        if self {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Every row of `table`, with the image's value at its own coordinate appended.
 ///
 /// `within` is the region the rows are **required** to lie in and `origin` is

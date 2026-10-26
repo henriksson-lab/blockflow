@@ -12,6 +12,15 @@ default = []
 # backend. Off by default so the default build, and CI's `members` job, do not
 # compile burn.
 deep-fill = ["dep:burn"]
+# The same network on a GPU (`segment::deep_fill::gpu`), chosen at run time
+# with `--deep-fill-device` (default auto: the GPU when one is reachable). The
+# device and its memory budget are `blockflow::gpu`'s (`BLOCKFLOW_GPU=off`,
+# `BLOCKFLOW_GPU_MEMORY`). `deep-fill-gpu` is the shared code and needs one of
+# the two runtimes; CUDA is the one measured. Both build without a CUDA
+# toolkit or a GPU (the driver and NVRTC are loaded at run time).
+deep-fill-gpu = ["deep-fill", "blockflow/gpu"]
+deep-fill-cuda = ["deep-fill-gpu", "burn/cuda", "blockflow/gpu-cuda"]
+deep-fill-wgpu = ["deep-fill-gpu", "burn/wgpu", "blockflow/gpu-wgpu"]
 
 [dependencies]
 blockflow = { path = "../..", features = ["zarr"] }

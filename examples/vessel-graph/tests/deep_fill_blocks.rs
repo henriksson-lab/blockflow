@@ -13,7 +13,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use blockflow::voxels::Voxels;
-use blockflow_vessel_graph::segment::{deep_fill, DeepFillOutput, DeepFillParams, DeepFillSetup};
+use blockflow_vessel_graph::segment::{
+    deep_fill, DeepFillDevice, DeepFillOutput, DeepFillParams, DeepFillSetup,
+};
 use ndarray::Array3;
 
 /// The network's tensors, in its state-dict names.
@@ -109,7 +111,8 @@ fn hollow_tubes(shape: [usize; 3]) -> Array3<bool> {
     })
 }
 
-fn run(
+fn run_on(
+    device: DeepFillDevice,
     mask: &Array3<bool>,
     weights: &Path,
     resample: usize,
@@ -122,10 +125,21 @@ fn run(
         &DeepFillSetup {
             weights: Some(weights.to_path_buf()),
             block,
+            device,
         },
         output,
     )
     .unwrap()
+}
+
+fn run(
+    mask: &Array3<bool>,
+    weights: &Path,
+    resample: usize,
+    block: [usize; 3],
+    output: DeepFillOutput,
+) -> Voxels {
+    run_on(DeepFillDevice::Cpu, mask, weights, resample, block, output)
 }
 
 /// Blocks of every grid here start inside the volume on some axis (x, past
@@ -200,6 +214,7 @@ fn weights_of_another_network_are_refused() {
         &DeepFillSetup {
             weights: Some(path.clone()),
             block: [8, 8, 8],
+            device: DeepFillDevice::Cpu,
         },
         DeepFillOutput::Filled,
     )
@@ -207,4 +222,62 @@ fn weights_of_another_network_are_refused() {
     .to_string();
     assert!(error.contains("conv1.weight"), "{error}");
     let _ = std::fs::remove_file(path);
+}
+
+/// The GPU network against the CPU one, on the seeded weights, whole and in
+/// blocks: the probabilities within 1e-4, and the masks differing only where
+/// the CPU's probability is within that of the threshold.
+#[cfg(feature = "deep-fill-gpu")]
+#[test]
+#[ignore = "needs a GPU (a `deep-fill-cuda` or `deep-fill-wgpu` build and a reachable device)"]
+fn the_gpu_agrees_with_the_cpu() {
+    let weights = random_weights();
+    let shape = [46, 100, 190];
+    let mask = hollow_tubes(shape);
+    for resample in [1, 2] {
+        let cpu = run(
+            &mask,
+            &weights,
+            resample,
+            shape,
+            DeepFillOutput::Probability,
+        );
+        let cpu = cpu.view::<f32>().unwrap().to_owned();
+        for block in [shape, [24, 48, 40]] {
+            let gpu = run_on(
+                DeepFillDevice::Gpu,
+                &mask,
+                &weights,
+                resample,
+                block,
+                DeepFillOutput::Probability,
+            );
+            let gpu = gpu.view::<f32>().unwrap();
+            let max = cpu
+                .iter()
+                .zip(gpu.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let filled = run_on(
+                DeepFillDevice::Gpu,
+                &mask,
+                &weights,
+                resample,
+                block,
+                DeepFillOutput::Filled,
+            );
+            let unexplained = filled
+                .view::<bool>()
+                .unwrap()
+                .iter()
+                .zip(&mask)
+                .zip(&cpu)
+                .filter(|((f, m), p)| **f != (**m || **p >= 0.5) && (**p - 0.5).abs() > 1e-4)
+                .count();
+            println!("resample {resample}, block {block:?}: max |gpu - cpu| {max:.2e}");
+            assert!(max < 1e-4, "resample {resample}, block {block:?}: {max}");
+            assert_eq!(unexplained, 0, "resample {resample}, block {block:?}");
+        }
+    }
+    let _ = std::fs::remove_file(weights);
 }

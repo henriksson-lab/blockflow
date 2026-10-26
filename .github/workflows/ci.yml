@@ -53,7 +53,8 @@
 #
 # **What is not here, and why.** The `*-cuda` features need a CUDA toolkit and a
 # device, and a hosted runner has neither. Everything else in `Cargo.toml` is
-# built by one of the jobs below.
+# built by one of the jobs below. (`vessel-graph`'s `deep-fill-cuda` is the
+# exception: its CUDA is loaded at run time, so the `cellpose+yolo` row builds it.)
 name: CI
 
 on:
@@ -107,9 +108,14 @@ jobs:
           # and at the same risk. Together in one row because they share `burn`,
           # which is most of what either costs to build. `vessel-graph`'s
           # `deep-fill` network (burn's CPU backend, as `yolo3d`) is built here
-          # too; the `members` job builds that example without the feature.
+          # too, with both of its GPU runtimes (`deep-fill-cuda`,
+          # `deep-fill-wgpu`): neither needs a toolkit or a device to build
+          # (cudarc loads the driver and NVRTC at run time, and without `nvcc`
+          # its build script takes the latest CUDA API), and the tests that need
+          # a device are `#[ignore]`d. The `members` job builds that example
+          # without the features.
           - os: ubuntu-latest
-            features: { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no", examples: "-p blockflow-cellpose-ome-zarr -p blockflow-cellpose-3d-ome-zarr -p blockflow-yolo-ome-zarr -p yolo3d -p blockflow-yolo-3d-ome-zarr -p blockflow-vessel-graph --features blockflow-vessel-graph/deep-fill" }
+            features: { name: cellpose+yolo, key: cellpose-yolo, flags: "--features cellpose,yolo", test: "no", examples: "-p blockflow-cellpose-ome-zarr -p blockflow-cellpose-3d-ome-zarr -p blockflow-yolo-ome-zarr -p yolo3d -p blockflow-yolo-3d-ome-zarr -p blockflow-vessel-graph --features blockflow-vessel-graph/deep-fill-cuda,blockflow-vessel-graph/deep-fill-wgpu" }
     steps:
       - uses: actions/checkout@v5
       - name: Install the stable toolchain

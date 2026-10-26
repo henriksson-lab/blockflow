@@ -41,11 +41,12 @@ impl Default for ReduceParams {
     }
 }
 
-/// Every vertex's `(edge, neighbour)` entries, ascending by edge id.
+/// Every vertex's incident edges, ascending by edge id; the neighbour along
+/// one is the edge's other end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Incidence {
     offsets: Vec<u32>,
-    entries: Vec<(u32, u32)>,
+    edges: Vec<u32>,
 }
 
 impl Incidence {
@@ -59,34 +60,41 @@ impl Incidence {
             offsets[index] += offsets[index - 1];
         }
         let mut cursor = offsets.clone();
-        let mut entries = vec![(0u32, 0u32); edges.len() * 2];
+        let mut incident = vec![0u32; edges.len() * 2];
         for (edge, [a, b]) in edges.iter().enumerate() {
             let edge = edge as u32;
-            entries[cursor[*a as usize] as usize] = (edge, *b);
+            incident[cursor[*a as usize] as usize] = edge;
             cursor[*a as usize] += 1;
-            entries[cursor[*b as usize] as usize] = (edge, *a);
+            incident[cursor[*b as usize] as usize] = edge;
             cursor[*b as usize] += 1;
         }
-        Self { offsets, entries }
+        Self {
+            offsets,
+            edges: incident,
+        }
     }
 
-    pub(crate) fn entries(&self, vertex: u32) -> &[(u32, u32)] {
+    pub(crate) fn degree(&self, vertex: u32) -> u32 {
         let at = vertex as usize;
-        &self.entries[self.offsets[at] as usize..self.offsets[at + 1] as usize]
+        self.offsets[at + 1] - self.offsets[at]
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChainKind {
-    Traced,
-    Direct,
-    PureLoop,
-}
+    pub(crate) fn edges(&self, vertex: u32) -> &[u32] {
+        let at = vertex as usize;
+        &self.edges[self.offsets[at] as usize..self.offsets[at + 1] as usize]
+    }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Chain {
-    vertices: Vec<u32>,
-    kind: ChainKind,
+    /// The `(edge, neighbour)` entries of `vertex`, ascending by edge id.
+    pub(crate) fn entries<'a>(
+        &'a self,
+        vertex: u32,
+        edges: &'a [[u32; 2]],
+    ) -> impl Iterator<Item = (u32, u32)> + 'a {
+        self.edges(vertex).iter().map(move |edge| {
+            let [a, b] = edges[*edge as usize];
+            (*edge, if a == vertex { b } else { a })
+        })
+    }
 }
 
 /// The polylines: one `[offsets[e], offsets[e + 1])` range of cleaned vertex
@@ -225,7 +233,7 @@ impl ReducedGraph {
         Ok(geometry
             .path(edge)
             .iter()
-            .map(|point| source.coordinates()[*point as usize])
+            .map(|point| source.coordinate(*point as usize))
             .collect())
     }
 
@@ -236,7 +244,7 @@ impl ReducedGraph {
         Ok(geometry
             .points()
             .iter()
-            .map(|point| source.coordinates()[*point as usize])
+            .map(|point| source.coordinate(*point as usize))
             .collect())
     }
 
@@ -288,163 +296,177 @@ impl ReducedGraph {
 pub fn reduce(graph: &CleanGraph, params: &ReduceParams) -> Result<ReducedGraph> {
     let n_vertices = graph.n_vertices();
     let edges = graph.edges();
-    let mut degree = vec![0u32; n_vertices];
-    for [a, b] in edges {
-        degree[*a as usize] += 1;
-        degree[*b as usize] += 1;
-    }
     let incidence = Incidence::of(n_vertices, edges);
-    let chains = find_chains(n_vertices, edges, &degree, &incidence)?;
+    let degree = |vertex: u32| incidence.degree(vertex);
 
     let mut old_to_new = vec![u32::MAX; n_vertices];
     let mut sources = Vec::new();
     let mut coordinates = Vec::new();
-    for (vertex, degree) in degree.iter().enumerate() {
-        if *degree != 2 {
-            old_to_new[vertex] = sources.len() as u32;
-            sources.push(vertex as u32);
-            coordinates.push(graph.coordinates()[vertex]);
+    for vertex in 0..n_vertices as u32 {
+        if degree(vertex) != 2 {
+            old_to_new[vertex as usize] = sources.len() as u32;
+            sources.push(vertex);
+            coordinates.push(graph.coordinate(vertex as usize));
         }
     }
 
-    let mut reduced = Vec::<[u32; 2]>::new();
-    let mut points = Vec::<u32>::new();
-    let mut offsets = vec![0u32];
     let mut report = ReduceReport {
         source_vertices: n_vertices,
         source_edges: edges.len(),
-        degree_2_vertices: degree.iter().filter(|degree| **degree == 2).count(),
-        isolated_vertices: degree.iter().filter(|degree| **degree == 0).count(),
+        degree_2_vertices: (0..n_vertices as u32)
+            .filter(|vertex| degree(*vertex) == 2)
+            .count(),
+        isolated_vertices: (0..n_vertices as u32)
+            .filter(|vertex| degree(*vertex) == 0)
+            .count(),
         ..ReduceReport::default()
     };
-    for chain in &chains {
-        match chain.kind {
-            ChainKind::Traced => report.traced_chains += 1,
-            ChainKind::Direct => report.direct_chains += 1,
-            ChainKind::PureLoop => report.loop_chains += 1,
-        }
-        let mut ends = chain
-            .vertices
-            .iter()
-            .filter(|vertex| degree[**vertex as usize] != 2);
-        let (Some(first), Some(last), None) = (ends.next(), ends.next(), ends.next()) else {
-            report.dropped_chains += 1;
-            report.vertices_dropped_with_chains += chain.vertices.len();
+    let mut out = Chains {
+        edges: Vec::new(),
+        points: Vec::new(),
+        offsets: vec![0u32],
+        geometry: params.edge_geometry,
+        old_to_new,
+    };
+    let mut visited_vertex = vec![false; n_vertices];
+    let mut chain = Vec::new();
+
+    // Traced chains, in edge order.
+    let mut visited_edge = vec![false; edges.len()];
+    for (edge, [a, b]) in edges.iter().enumerate() {
+        let (left, right) = (degree(*a) == 2, degree(*b) == 2);
+        if left == right || visited_edge[edge] {
             continue;
-        };
-        if Some(first) != chain.vertices.first() || Some(last) != chain.vertices.last() {
-            return Err(Error::invalid(format!(
-                "a chain's endpoints are {first} and {last} but its path runs {:?}..{:?}.",
-                chain.vertices.first(),
-                chain.vertices.last()
-            )));
         }
-        reduced.push([old_to_new[*first as usize], old_to_new[*last as usize]]);
-        if params.edge_geometry {
-            points.extend_from_slice(&chain.vertices);
-            let end = u32::try_from(points.len()).map_err(|_| {
-                Error::invalid(format!(
-                    "the edge geometry passed {} points, which does not fit a u32 offset.",
-                    points.len()
-                ))
-            })?;
-            offsets.push(end);
+        let (start, mut current) = if left { (*b, *a) } else { (*a, *b) };
+        visited_edge[edge] = true;
+        chain.clear();
+        chain.extend([start, current]);
+        let mut previous = start;
+        while degree(current) == 2 {
+            let Some((edge, neighbour)) = incidence
+                .entries(current, edges)
+                .find(|(edge, neighbour)| *neighbour != previous && !visited_edge[*edge as usize])
+            else {
+                break;
+            };
+            visited_edge[edge as usize] = true;
+            chain.push(neighbour);
+            previous = current;
+            current = neighbour;
         }
+        report.traced_chains += 1;
+        out.push(&chain, &degree, &mut report, &mut visited_vertex)?;
+    }
+    drop(visited_edge);
+    // Direct chains, in edge order.
+    for [a, b] in edges {
+        if degree(*a) != 2 && degree(*b) != 2 {
+            report.direct_chains += 1;
+            out.push(&[*a, *b], &degree, &mut report, &mut visited_vertex)?;
+        }
+    }
+    // Pure loops, each from its lowest vertex.
+    for vertex in 0..n_vertices {
+        if visited_vertex[vertex] || degree(vertex as u32) != 2 {
+            continue;
+        }
+        let vertices = loop_from(vertex as u32, &degree, &incidence, edges)?;
+        report.loop_chains += 1;
+        out.push(&vertices, &degree, &mut report, &mut visited_vertex)?;
+    }
+    if let Some(vertex) = (0..n_vertices).find(|v| !visited_vertex[*v] && degree(*v as u32) > 0) {
+        return Err(Error::invalid(format!(
+            "vertex {vertex}, of degree {}, lies on no chain; the walk and the incidence \
+             structure disagree.",
+            degree(vertex as u32)
+        )));
     }
     Ok(ReducedGraph {
         volume: graph.volume(),
         source_vertices: n_vertices,
         coordinates,
         sources,
-        edges: reduced,
-        geometry: params
-            .edge_geometry
-            .then_some(EdgeGeometry { offsets, points }),
+        edges: out.edges,
+        geometry: params.edge_geometry.then_some(EdgeGeometry {
+            offsets: out.offsets,
+            points: out.points,
+        }),
         report,
     })
 }
 
-fn find_chains(
-    n_vertices: usize,
-    edges: &[[u32; 2]],
-    degree: &[u32],
-    incidence: &Incidence,
-) -> Result<Vec<Chain>> {
-    let mut chains = Vec::new();
-    let mut visited_edge = vec![false; edges.len()];
-    for (edge, [a, b]) in edges.iter().enumerate() {
-        let (left, right) = (degree[*a as usize] == 2, degree[*b as usize] == 2);
-        if left == right || visited_edge[edge] {
-            continue;
+/// The reduced edges and polylines, written as the chains are found.
+struct Chains {
+    edges: Vec<[u32; 2]>,
+    points: Vec<u32>,
+    offsets: Vec<u32>,
+    geometry: bool,
+    old_to_new: Vec<u32>,
+}
+
+impl Chains {
+    /// One chain, in the order found: an edge between its two ends, or
+    /// dropped when it has not exactly two (a pure loop).
+    fn push(
+        &mut self,
+        chain: &[u32],
+        degree: &dyn Fn(u32) -> u32,
+        report: &mut ReduceReport,
+        visited: &mut [bool],
+    ) -> Result<()> {
+        for vertex in chain {
+            visited[*vertex as usize] = true;
         }
-        let (start, mut current) = if left { (*b, *a) } else { (*a, *b) };
-        visited_edge[edge] = true;
-        let mut vertices = vec![start, current];
-        let mut previous = start;
-        while degree[current as usize] == 2 {
-            let Some((edge, neighbour)) = incidence
-                .entries(current)
-                .iter()
-                .copied()
-                .find(|(edge, neighbour)| *neighbour != previous && !visited_edge[*edge as usize])
-            else {
-                break;
-            };
-            visited_edge[edge as usize] = true;
-            vertices.push(neighbour);
-            previous = current;
-            current = neighbour;
+        let mut ends = chain.iter().filter(|vertex| degree(**vertex) != 2);
+        let (Some(first), Some(last), None) = (ends.next(), ends.next(), ends.next()) else {
+            report.dropped_chains += 1;
+            report.vertices_dropped_with_chains += chain.len();
+            return Ok(());
+        };
+        if Some(first) != chain.first() || Some(last) != chain.last() {
+            return Err(Error::invalid(format!(
+                "a chain's endpoints are {first} and {last} but its path runs {:?}..{:?}.",
+                chain.first(),
+                chain.last()
+            )));
         }
-        chains.push(Chain {
-            vertices,
-            kind: ChainKind::Traced,
-        });
+        self.edges.push([
+            self.old_to_new[*first as usize],
+            self.old_to_new[*last as usize],
+        ]);
+        if self.geometry {
+            self.points.extend_from_slice(chain);
+            let end = u32::try_from(self.points.len()).map_err(|_| {
+                Error::invalid(format!(
+                    "the edge geometry passed {} points, which does not fit a u32 offset.",
+                    self.points.len()
+                ))
+            })?;
+            self.offsets.push(end);
+        }
+        Ok(())
     }
-    for [a, b] in edges {
-        if degree[*a as usize] != 2 && degree[*b as usize] != 2 {
-            chains.push(Chain {
-                vertices: vec![*a, *b],
-                kind: ChainKind::Direct,
-            });
-        }
-    }
-    let mut visited_vertex = vec![false; n_vertices];
-    for chain in &chains {
-        for vertex in &chain.vertices {
-            visited_vertex[*vertex as usize] = true;
-        }
-    }
-    for vertex in 0..n_vertices {
-        if visited_vertex[vertex] || degree[vertex] != 2 {
-            continue;
-        }
-        let vertices = loop_from(vertex as u32, degree, incidence)?;
-        for vertex in &vertices {
-            visited_vertex[*vertex as usize] = true;
-        }
-        chains.push(Chain {
-            vertices,
-            kind: ChainKind::PureLoop,
-        });
-    }
-    if let Some(vertex) = (0..n_vertices).find(|v| !visited_vertex[*v] && degree[*v] > 0) {
-        return Err(Error::invalid(format!(
-            "vertex {vertex}, of degree {}, lies on no chain; the walk and the incidence \
-             structure disagree.",
-            degree[vertex]
-        )));
-    }
-    Ok(chains)
 }
 
 /// The vertices of the degree-2 run through `v0`, in walk order.
-fn loop_from(v0: u32, degree: &[u32], incidence: &Incidence) -> Result<Vec<u32>> {
-    let entries = incidence.entries(v0);
-    let (mut forward, endpoint) = follow(entries[0], v0, degree, incidence)?;
+fn loop_from(
+    v0: u32,
+    degree: &dyn Fn(u32) -> u32,
+    incidence: &Incidence,
+    edges: &[[u32; 2]],
+) -> Result<Vec<u32>> {
+    let mut entries = incidence.entries(v0, edges);
+    let (Some(first), Some(second)) = (entries.next(), entries.next()) else {
+        return Err(Error::invalid(format!(
+            "vertex {v0} is on a loop of degree-2 vertices and has fewer than two edges."
+        )));
+    };
+    let (mut forward, endpoint) = follow(first, v0, degree, incidence, edges)?;
     if endpoint == v0 {
         return Ok(forward);
     }
-    let (backward, _) = follow(entries[1], v0, degree, incidence)?;
+    let (backward, _) = follow(second, v0, degree, incidence, edges)?;
     forward.reverse();
     forward.push(v0);
     forward.extend(backward);
@@ -454,17 +476,16 @@ fn loop_from(v0: u32, degree: &[u32], incidence: &Incidence) -> Result<Vec<u32>>
 fn follow(
     entry: (u32, u32),
     v0: u32,
-    degree: &[u32],
+    degree: &dyn Fn(u32) -> u32,
     incidence: &Incidence,
+    edges: &[[u32; 2]],
 ) -> Result<(Vec<u32>, u32)> {
     let (_, mut vertex) = entry;
     let mut previous = v0;
     let mut vertices = vec![vertex];
-    while degree[vertex as usize] == 2 && vertex != v0 {
+    while degree(vertex) == 2 && vertex != v0 {
         let Some((_, next)) = incidence
-            .entries(vertex)
-            .iter()
-            .copied()
+            .entries(vertex, edges)
             .find(|(_, neighbour)| *neighbour != previous)
         else {
             return Err(Error::invalid(format!(
@@ -497,12 +518,13 @@ mod tests {
         let incidence = Incidence::of(cleaned.n_vertices(), cleaned.edges());
         let csr = cleaned.adjacency();
         for vertex in 0..cleaned.n_vertices() as u32 {
-            let entries = incidence.entries(vertex);
+            let entries: Vec<_> = incidence.entries(vertex, cleaned.edges()).collect();
             assert_eq!(entries.len(), csr.degree(vertex));
+            assert_eq!(incidence.degree(vertex) as usize, csr.degree(vertex));
             assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
             for (edge, neighbour) in entries {
-                let [a, b] = cleaned.edges()[*edge as usize];
-                assert!((a == vertex && b == *neighbour) || (b == vertex && a == *neighbour));
+                let [a, b] = cleaned.edges()[edge as usize];
+                assert!((a == vertex && b == neighbour) || (b == vertex && a == neighbour));
             }
         }
     }

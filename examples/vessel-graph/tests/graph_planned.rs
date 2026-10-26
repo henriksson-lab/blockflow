@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::AttachedImage;
-use blockflow_vessel_graph::graph::planned::{PlanParams, StoredInputs};
+use blockflow_vessel_graph::graph::planned::{PlanParams, StoredInputs, GRAPH_BYTES_PER_VERTEX};
 use blockflow_vessel_graph::graph::{
     vessel_graph, vessel_graph_stored, GraphParams, Inputs, RadiusParams,
 };
@@ -177,10 +177,11 @@ fn the_planned_graph_is_the_resident_graph_on_every_grid() {
         };
         let resident = vessel_graph(&inputs, &params).unwrap().to_json();
         for (block, pack_block) in [
-            ([64, 64, 64], [64, 64, 64]),
-            ([18, 26, 22], [16, 16, 32]),
-            ([7, 13, 11], [5, 9, 17]),
-            ([36, 4, 44], [36, 52, 3]),
+            (Some([64, 64, 64]), Some([64, 64, 64])),
+            (Some([18, 26, 22]), Some([16, 16, 32])),
+            (Some([7, 13, 11]), Some([5, 9, 17])),
+            (Some([36, 4, 44]), Some([36, 52, 3])),
+            (None, None),
         ] {
             let plan = PlanParams {
                 block,
@@ -188,6 +189,7 @@ fn the_planned_graph_is_the_resident_graph_on_every_grid() {
                 workers: 4,
                 cache_bytes: 16 << 20,
                 work: dir.join(format!("work-{block:?}")),
+                resident_bytes_per_vertex: GRAPH_BYTES_PER_VERTEX,
             };
             let planned = vessel_graph_stored(&stored, &params, &plan)
                 .unwrap()
@@ -230,11 +232,12 @@ fn a_volume_of_another_shape_is_refused() {
         spacing: SPACING,
     };
     let plan = PlanParams {
-        block: [16, 16, 16],
-        pack_block: [16, 16, 16],
+        block: Some([16, 16, 16]),
+        pack_block: Some([16, 16, 16]),
         workers: 2,
         cache_bytes: 1 << 20,
         work: dir.join("work"),
+        resident_bytes_per_vertex: 0,
     };
     let error = vessel_graph_stored(&stored, &GraphParams::default(), &plan)
         .unwrap_err()

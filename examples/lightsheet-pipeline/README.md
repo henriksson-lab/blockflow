@@ -41,7 +41,7 @@ examples/lightsheet-pipeline/run.sh SAMPLE_DIR PARAMS [STAGE...]
 | `AUTOFLUORESCENCE` | the autofluorescence image (relative to the sample) |
 | `ATLAS` | a prepared atlas (`atlas-prepare`) in the sample's orientation |
 | `ALIGNMENT_DIR`, `SIGNAL_TO_AUTO`, `AUTO_TO_ATLAS` | elastix parameter files per step |
-| `SIGNAL_TO_AUTO_INITIAL` | how the signal -> autofluorescence step starts: empty (the file's, the centres), `physical`, `centre`, or `Z,Y,X` (an initial translation in µm; `atlas-registration --initial-translation 0=…`) |
+| `SIGNAL_TO_AUTO_INITIAL` | how the signal -> autofluorescence step starts: empty (the file's, the centres), `physical`, `centre`, `search` (the translation a coarse-to-fine correlation search finds; `atlas-registration --initialise 0=search`), or `Z,Y,X` (an initial translation in µm, overriding any search; `--initial-translation 0=…`) |
 | `STITCH_LEVEL`, `STITCH_OVERLAP`, `STITCH_ROWS`, `STITCH_COLUMNS`, `STITCH_MAX_SHIFT`, `STITCH_RIGID_MAX_SHIFT`, `STITCH_MAX_SHIFT_Z`, `STITCH_RIGID_ONLY`, `STITCH_ARGS` | `tile-stitching --tile-dir` (search ranges in voxels of `STITCH_LEVEL`) |
 | `FUSE_LEVEL` | level of the whole fused volume, the registration's signal |
 | `REGISTRATION_RESOLUTION`, `REGISTRATION_ARGS` | `atlas-registration chain` |
@@ -109,7 +109,9 @@ prepared atlas named by `ATLAS`, the registration chain's last image.
 Run 2026-10-19 (blockflow `780f2cf` plus the uncommitted examples; binaries
 built 02:11-02:37 the same day), `params/osf-cztq2.env`, 40 tiles of
 1030 x 1007 x 1004, outputs in
-`/husky/henriksson/lightsheet-reference/pipeline/osf-cztq2/`:
+`/husky/henriksson/lightsheet-reference/pipeline/osf-cztq2/`. That run gave
+`STITCH_OVERLAP=120,120`; the tiles now carry those grid positions as their
+translations (below), and the stitch from them is identical:
 
 | stage | what | wall | peak RSS | disk |
 |---|---|---|---|---|
@@ -181,12 +183,33 @@ in-plane position (taking the `X_Offset`/`Y_Offset` of its scan settings as
 the field's centre misses by 2.1 mm in y and 0.3 mm in x). Started from the
 centres (the
 reference's file), the affine collapses (an x scale of 0.056); from the
-physical frames it finds no overlap at all. So the step starts from an
-initial translation, `SIGNAL_TO_AUTO_INITIAL=0,3420,4535` µm: where a
-normalised cross-correlation of the log intensities of the strip over the
-autofluorescence (`checks/find_translation.py`) puts it (on 50 and 30 µm grids: (9, 3432, 4530) and (-3,
-3412, 4540) µm). On a 25 µm grid the log-intensity correlation is 0.583 at
-that translation and 0.574 after the affine. The registration's own
+physical frames it finds no overlap at all. That run started the step from an initial translation measured by hand,
+`0,3420,4535` µm: where a normalised cross-correlation of the log intensities
+of the strip over the autofluorescence (`checks/find_translation.py`) puts it
+(on 50 and 30 µm grids: (9, 3432, 4530) and (-3, 3412, 4540) µm). On a 25 µm
+grid the log-intensity correlation is 0.583 at that translation and 0.574
+after the affine.
+
+The registration now finds it itself (`SIGNAL_TO_AUTO_INITIAL=search`,
+`atlas-registration --initialise 0=search`, its README): an exhaustive masked
+NCC at 100 µm, then hill-climbing at 50 and 25 µm. Rerun 2026-10-22 into
+`/husky/henriksson/lightsheet-reference/round3/E/pipeline/osf-sa3x8/` (the
+same stitch):
+
+- found **(-11, 3404, 4541) µm**, within one 25 µm voxel of the hand value
+  on every axis (-11, -16, +6 µm); NCC 0.558 at 25 µm; the runner-up (at
+  (2698, 3975, 2823) µm, overlap 50%) 0.20 below at 50 µm, where it was
+  dropped; 1.0-4.3 s (load 30-50 on 40 cores), no measurable peak memory
+  (2.40 GB for the register stage either way);
+- the chain from it against the hand-started chain, the run's 58 788 vessel
+  vertices: **median 3.0 µm, 95th percentile 6.0 µm** apart in the atlas,
+  same finest region 98.8%, region shares within 0.1 point (SSs2/3 48.9%,
+  SSs1 26.7%, SSs4 21.4%); a second seed of the hand-started step 0 moves
+  them by 9.3 / 10.8 µm (98.1% same region). Over 20 000 random points of
+  the whole strip: 16 / 42 µm (seed: 12 / 27 µm), 92.6% same finest region
+  (seed: 94.7%). The autofluorescence -> atlas step does not change.
+
+The registration's own
 similarity numbers for this step are low (correlation 0.038, MI 0.012)
 because they are on raw intensities, which the sparse, bright vessels
 dominate; the autofluorescence -> atlas step reaches correlation 0.780 / MI
@@ -215,9 +238,21 @@ runs from above the dorsal surface about 0.5 mm into the cortex.
 - The registration's signal is fused at level 2 from level-1 positions, so
   in-plane positions are rounded to 6.5 µm there (half a voxel at most);
   level-0 boxes reuse the level-1 positions doubled, exactly.
-- The stitching overlap of osf-cztq2 has to be given (`STITCH_OVERLAP`): its
-  conversion carries no translations, and its LaVision positions are refused
-  (row 07 repeats row 00; tile-stitching README).
-- A partial mosaic (osf-sa3x8) needs `SIGNAL_TO_AUTO_INITIAL`: nothing in the
-  autofluorescence's metadata places it in the tiles' stage frame, so the
-  translation is measured (`checks/find_translation.py`, run by hand).
+- osf-cztq2's LaVision positions are refused (row 07 repeats row 00), and
+  the vendor pitch is 2% longer than the stitched one, more than the row
+  search covers (a stitch from them leaves the y step at its nominal 1472.7
+  µm). Its conversions therefore carry grid positions (written 2026-10-22,
+  `img2omezarr set-positions --overlap 119,120 --grid-unit voxel` on
+  `/husky/otherdataset/teresa/clearmap_em/osf-cztq2/cFos`, the previous
+  `zarr.json` files backed up in
+  `/husky/henriksson/lightsheet-reference/round3/E/backup-cztq2-zarr-json/`).
+  On a metadata mirror the dry run warned of nothing, and `align` from them
+  without `STITCH_OVERLAP` gave every nominal, rigid and per-slice position
+  and all 67 alignments identical to the `STITCH_OVERLAP=120,120` run; row
+  07 lands 1430-1459 µm below row 06 (row 05 -> 06: 1440-1450 µm).
+- A partial mosaic (osf-sa3x8) needs `SIGNAL_TO_AUTO_INITIAL=search`: nothing
+  in the autofluorescence's metadata places it in the tiles' stage frame, so
+  the translation is found from the images. The search is translation only;
+  it refuses an ambiguous or weak match, and then a `Z,Y,X` must be given
+  (`checks/find_translation.py` is the independent check it was validated
+  against).

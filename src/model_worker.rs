@@ -64,10 +64,7 @@ pub struct WorkerArray {
 impl WorkerArray {
     pub fn validate(&self) -> Result<()> {
         self.artifact.validate()?;
-        if self.shape.is_empty()
-            || self.shape.len() != self.axes.len()
-            || self.shape.iter().any(|&extent| extent == 0)
-        {
+        if self.shape.is_empty() || self.shape.len() != self.axes.len() || self.shape.contains(&0) {
             return Err(Error::invalid(
                 "worker array shape and axes are inconsistent",
             ));
@@ -238,7 +235,7 @@ impl ModelWorkerRequest {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ModelWorkerCommand {
-    Request { request: ModelWorkerRequest },
+    Request { request: Box<ModelWorkerRequest> },
     Cancel { request_id: String },
     Health { request_id: String },
 }

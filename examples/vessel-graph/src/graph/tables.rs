@@ -36,14 +36,13 @@ use std::path::{Path, PathBuf};
 
 use blockflow::error::{Error, Result};
 use blockflow::object_table::{
-    write_object_rows, ColumnRole, ColumnSpec, CoordinateColumn, DType, ObjectValue,
+    ColumnRole, ColumnSpec, CoordinateColumn, DType, ObjectTableBuilder, ObjectValue,
     SpatialIndexSpec, TableReader, TableSpec,
 };
 use blockflow::ome_zarr::ensure_zarr_group;
 use serde_json::json;
 
-use super::columns::Column;
-use super::vessel::{Lattice, VesselGraph};
+use super::vessel::{ColumnRead, Lattice, Level, VesselGraph};
 
 /// The spatial index's tile, `[z, y, x]`.
 const TILE_ZYX: [u64; 3] = [32, 256, 256];
@@ -110,76 +109,99 @@ fn unit_of(name: &str, unit: &str) -> Option<String> {
     }
 }
 
-/// A table under construction: its columns and, per row, its values.
-struct Builder {
-    columns: Vec<ColumnSpec>,
-    rows: Vec<Vec<ObjectValue>>,
+/// How much memory the table writer may hold, and where it spills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableMemory {
+    /// The bytes the buffered rows of one table may take
+    /// ([`ObjectTableBuilder::row_bytes`] each); `u64::MAX` keeps every row
+    /// in memory.
+    pub buffer_bytes: u64,
+    /// Where the sorted runs of a table larger than the buffer go (removed
+    /// afterwards). Needed only with a finite buffer.
+    pub temporary: Option<PathBuf>,
 }
 
-impl Builder {
-    fn new(identity: &str, rows: usize, unit: &str) -> Self {
-        let mut columns = vec![ColumnSpec::new(identity, DType::U64, ColumnRole::Identity)];
+impl TableMemory {
+    /// Every row in memory.
+    pub fn unbounded() -> Self {
+        Self {
+            buffer_bytes: u64::MAX,
+            temporary: None,
+        }
+    }
+}
+
+/// What the largest of the three tables takes when every row is buffered
+/// (`ObjectTableBuilder::row_bytes` a row): what a writer needs to sort it in
+/// memory without a run on disk.
+pub fn table_buffer_bytes(graph: &VesselGraph) -> u64 {
+    let width = |level: Level, skipped: usize| -> usize {
+        graph
+            .columns(level)
+            .iter()
+            .map(|(_, column)| column.width())
+            .sum::<usize>()
+            .saturating_sub(skipped)
+    };
+    // The identity and six positions, the integer columns, the graph's.
+    [
+        (graph.n_vertices(), 7 + 1 + width(Level::Vertex, 3)),
+        (graph.n_edges(), 7 + 4 + width(Level::Edge, 0)),
+        (graph.n_points(), 7 + 2 + width(Level::Along, 3)),
+    ]
+    .iter()
+    .map(|(rows, columns)| {
+        (*rows as u64).saturating_mul(ObjectTableBuilder::row_bytes_of(*columns))
+    })
+    .max()
+    .unwrap_or(0)
+}
+
+/// A table's columns: the identity, the voxel position and the physical
+/// one, then whatever is pushed.
+struct Columns {
+    specs: Vec<ColumnSpec>,
+}
+
+impl Columns {
+    fn new(identity: &str, unit: &str) -> Self {
+        let mut specs = vec![ColumnSpec::new(identity, DType::U64, ColumnRole::Identity)];
         for axis in ["z", "y", "x"] {
             let mut spec = ColumnSpec::new(axis, DType::F64, ColumnRole::Coordinate);
             spec.unit = Some("voxel".into());
             spec.display_name = Some(format!("{axis} (level-0 voxel)"));
-            columns.push(spec);
+            specs.push(spec);
         }
         for axis in ["z", "y", "x"] {
             let mut spec =
                 ColumnSpec::new(format!("{axis}_um"), DType::F64, ColumnRole::Measurement);
             spec.unit = Some(unit.to_string());
             spec.display_name = Some(format!("{axis} (physical)"));
-            columns.push(spec);
+            specs.push(spec);
         }
-        Self {
-            columns,
-            rows: (0..rows).map(|_| Vec::new()).collect(),
-        }
-    }
-
-    /// Room for `more` columns beyond those declared, in every row, so that
-    /// the rows are not grown by doubling.
-    fn reserve(&mut self, more: usize) {
-        let wanted = self.columns.len() + more;
-        for row in &mut self.rows {
-            row.reserve_exact(wanted.saturating_sub(row.len()));
-        }
-    }
-
-    /// The identity, the voxel position and the physical one, per row.
-    fn positions(&mut self, positions: &[[f64; 3]], lattice: &Lattice) {
-        for (row, (values, at)) in self.rows.iter_mut().zip(positions).enumerate() {
-            let physical = lattice.physical(*at);
-            values.push(ObjectValue::U64(row as u64));
-            values.extend(at.iter().map(|v| ObjectValue::F64(*v)));
-            values.extend(physical.iter().map(|v| ObjectValue::F64(*v)));
-        }
+        Self { specs }
     }
 
     fn push(&mut self, name: &str, dtype: DType, role: ColumnRole, unit: Option<String>) {
         let mut spec = ColumnSpec::new(name, dtype, role);
         spec.unit = unit;
-        self.columns.push(spec);
+        self.specs.push(spec);
     }
 
-    fn integers(&mut self, name: &str, dtype: DType, values: impl Iterator<Item = u64>) {
+    fn integer(&mut self, name: &str, dtype: DType) {
         self.push(name, dtype, ColumnRole::Measurement, None);
-        for (row, value) in self.rows.iter_mut().zip(values) {
-            row.push(match dtype {
-                DType::U32 => ObjectValue::U32(value as u32),
-                _ => ObjectValue::U64(value),
-            });
-        }
     }
 
-    /// Every column of one graph level, but `skip`.
+    /// Every column of one graph level, but `skip`: their table columns
+    /// declared, and the columns returned with the dtype their values are
+    /// written as.
     fn graph_columns<'a>(
         &mut self,
-        columns: impl Iterator<Item = (&'a str, &'a Column)>,
+        columns: Vec<(&'a str, ColumnRead<'a>)>,
         skip: &[&str],
         unit: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<(ColumnRead<'a>, DType)>> {
+        let mut out = Vec::new();
         for (name, column) in columns {
             if skip.contains(&name) {
                 continue;
@@ -199,7 +221,7 @@ impl Builder {
                 }
             };
             for column_name in &names {
-                if self.columns.iter().any(|spec| &spec.name == column_name) {
+                if self.specs.iter().any(|spec| &spec.name == column_name) {
                     return Err(Error::invalid(format!(
                         "the graph column `{name}` would write the table column `{column_name}`, \
                          which is already there."
@@ -207,22 +229,19 @@ impl Builder {
                 }
                 self.push(column_name, dtype, role, unit_of(name, unit));
             }
-            for (index, row) in self.rows.iter_mut().enumerate() {
-                for v in column.row(index) {
-                    row.push(value(dtype, *v));
-                }
-            }
+            out.push((column, dtype));
         }
-        Ok(())
+        Ok(out)
     }
 
-    fn write(
+    /// The table's builder, its rows to be pushed in any order.
+    fn builder(
         self,
-        root: &Path,
         identity: &str,
         geometry: &TableGeometry,
         extension: serde_json::Value,
-    ) -> Result<TableReader> {
+        memory: &TableMemory,
+    ) -> Result<ObjectTableBuilder> {
         let shape = geometry.shape;
         let spatial_index = SpatialIndexSpec {
             coordinates: ["z", "y", "x"]
@@ -240,33 +259,65 @@ impl Builder {
             within_tile_order: "lexicographic_coordinates_then_identity".into(),
             downsample: None,
         };
-        let mut spec = TableSpec::new(0, 4096, "../../", identity, self.columns, spatial_index);
+        let mut spec = TableSpec::new(0, 4096, "../../", identity, self.specs, spatial_index);
         spec.extensions.insert("vessel_graph".into(), extension);
-        if root.exists() {
-            fs::remove_dir_all(root).map_err(Error::backend)?;
-        }
-        write_object_rows(root, spec, self.rows)
+        ObjectTableBuilder::new(spec, memory.temporary.as_ref(), memory.buffer_bytes)
     }
 }
 
-/// The table columns a level's graph columns make, less `skipped` columns
-/// of width 3 (the coordinates): only a reservation, so an estimate is safe.
-fn widths<'a>(columns: impl Iterator<Item = Option<&'a Column>>, skipped: usize) -> usize {
-    columns
-        .flatten()
-        .map(Column::width)
-        .sum::<usize>()
-        .saturating_sub(3 * skipped)
+/// One row's values, built in place.
+struct Row {
+    values: Vec<ObjectValue>,
+}
+
+impl Row {
+    /// The identity, the voxel position and the physical one.
+    fn start(&mut self, id: usize, at: [f64; 3], lattice: &Lattice) {
+        self.values.clear();
+        self.values.push(ObjectValue::U64(id as u64));
+        self.values.extend(at.iter().map(|v| ObjectValue::F64(*v)));
+        let physical = lattice.physical(at);
+        self.values
+            .extend(physical.iter().map(|v| ObjectValue::F64(*v)));
+    }
+
+    fn push(&mut self, value: ObjectValue) {
+        self.values.push(value);
+    }
+
+    /// Row `row` of every graph column, a value per axis.
+    fn graph_columns(&mut self, columns: &[(ColumnRead<'_>, DType)], row: usize) {
+        for (column, dtype) in columns {
+            for axis in 0..column.width() {
+                self.values.push(value(*dtype, column.value(row, axis)));
+            }
+        }
+    }
 }
 
 /// Write `graph` as its three tables under `tables` (created as a Zarr group
 /// if absent), replacing any earlier tables of the same `name`. Coordinates
-/// are the graph's `coordinates` column, level-0 voxels of the image.
+/// are the graph's `coordinates` column, level-0 voxels of the image. Every
+/// row is held in memory; [`write_graph_tables_within`] bounds that.
 pub fn write_graph_tables(
     graph: &VesselGraph,
     tables: &Path,
     name: &str,
     geometry: &TableGeometry,
+) -> Result<GraphTables> {
+    write_graph_tables_within(graph, tables, name, geometry, &TableMemory::unbounded())
+}
+
+/// [`write_graph_tables`] with each table's buffered rows held to `memory`:
+/// the rows are made one at a time from the graph's columns and pushed to a
+/// [`ObjectTableBuilder`], which spills sorted runs past its buffer. The
+/// tables are the same files whatever the buffer.
+pub fn write_graph_tables_within(
+    graph: &VesselGraph,
+    tables: &Path,
+    name: &str,
+    geometry: &TableGeometry,
+    memory: &TableMemory,
 ) -> Result<GraphTables> {
     let roots = GraphTables::under(tables, name);
     ensure_zarr_group(tables)?;
@@ -286,99 +337,87 @@ pub fn write_graph_tables(
     };
     let unit = geometry.unit.as_str();
     let lattice = geometry.lattice;
+    let mut row = Row { values: Vec::new() };
+    let point = |column: &ColumnRead<'_>, at: usize| -> [f64; 3] {
+        std::array::from_fn(|axis| column.value(at, axis))
+    };
 
     // Vertices.
-    let vertices = graph.points("coordinates")?;
-    let mut table = Builder::new("vertex_id", vertices.len(), unit);
-    table.reserve(1 + widths(graph.vertex_names().into_iter().map(|n| graph.vertex(n)), 1));
-    table.positions(&vertices, &lattice);
-    table.integers(
-        "degree",
-        DType::U32,
-        graph.degrees().into_iter().map(|d| d as u64),
-    );
-    table.graph_columns(
-        graph
-            .vertex_names()
-            .into_iter()
-            .filter_map(|n| graph.vertex(n).map(|c| (n, c))),
-        &["coordinates"],
-        unit,
-    )?;
-    table.write(
-        &roots.vertices,
-        "vertex_id",
-        geometry,
-        extension("vertices"),
-    )?;
+    let coordinates = graph.named(Level::Vertex, "coordinates")?;
+    check_points(&coordinates)?;
+    let mut columns = Columns::new("vertex_id", unit);
+    columns.integer("degree", DType::U32);
+    let carried = columns.graph_columns(graph.columns(Level::Vertex), &["coordinates"], unit)?;
+    let mut table = columns.builder("vertex_id", geometry, extension("vertices"), memory)?;
+    table.reserve(graph.n_vertices());
+    let degrees = graph.degrees();
+    for (vertex, degree) in degrees.iter().enumerate() {
+        row.start(vertex, point(&coordinates, vertex), &lattice);
+        row.push(ObjectValue::U32(*degree as u32));
+        row.graph_columns(&carried, vertex);
+        table.push(&row.values)?;
+    }
+    drop(degrees);
+    finish(table, &roots.vertices)?;
 
     // Edges, each at its polyline's middle point.
-    let along = graph.along_points("coordinates")?;
-    let ranges = graph.ranges();
-    let middles: Vec<[f64; 3]> = ranges
-        .iter()
-        .map(|[start, end]| along[start + (end - start) / 2])
-        .collect();
-    let mut table = Builder::new("edge_id", graph.n_edges(), unit);
-    table.reserve(4 + widths(graph.edge_names().into_iter().map(|n| graph.edge(n)), 0));
-    table.positions(&middles, &lattice);
-    table.integers(
-        "source",
-        DType::U64,
-        graph.edges().iter().map(|e| u64::from(e[0])),
-    );
-    table.integers(
-        "target",
-        DType::U64,
-        graph.edges().iter().map(|e| u64::from(e[1])),
-    );
-    table.integers(
-        "point_start",
-        DType::U64,
-        ranges.iter().map(|r| r[0] as u64),
-    );
-    table.integers(
-        "point_count",
-        DType::U32,
-        ranges.iter().map(|r| (r[1] - r[0]) as u64),
-    );
-    table.graph_columns(
-        graph
-            .edge_names()
-            .into_iter()
-            .filter_map(|n| graph.edge(n).map(|c| (n, c))),
-        &[],
-        unit,
-    )?;
-    table.write(&roots.edges, "edge_id", geometry, extension("edges"))?;
+    let along = graph.named(Level::Along, "coordinates")?;
+    check_points(&along)?;
+    let ranges = graph.polylines();
+    let mut columns = Columns::new("edge_id", unit);
+    columns.integer("source", DType::U64);
+    columns.integer("target", DType::U64);
+    columns.integer("point_start", DType::U64);
+    columns.integer("point_count", DType::U32);
+    let carried = columns.graph_columns(graph.columns(Level::Edge), &[], unit)?;
+    let mut table = columns.builder("edge_id", geometry, extension("edges"), memory)?;
+    table.reserve(graph.n_edges());
+    for (edge, ([start, end], [source, target])) in ranges.iter().zip(graph.edges()).enumerate() {
+        let (start, end) = (*start as usize, *end as usize);
+        row.start(edge, point(&along, start + (end - start) / 2), &lattice);
+        row.push(ObjectValue::U64(u64::from(*source)));
+        row.push(ObjectValue::U64(u64::from(*target)));
+        row.push(ObjectValue::U64(start as u64));
+        row.push(ObjectValue::U32((end - start) as u32));
+        row.graph_columns(&carried, edge);
+        table.push(&row.values)?;
+    }
+    finish(table, &roots.edges)?;
 
     // Polyline points.
-    let mut edge_of = vec![0u64; along.len()];
-    let mut index_of = vec![0u64; along.len()];
+    let mut columns = Columns::new("point_id", unit);
+    columns.integer("edge_id", DType::U64);
+    columns.integer("index", DType::U32);
+    let carried = columns.graph_columns(graph.columns(Level::Along), &["coordinates"], unit)?;
+    let mut table = columns.builder("point_id", geometry, extension("edge_points"), memory)?;
+    table.reserve(graph.n_points());
     for (edge, [start, end]) in ranges.iter().enumerate() {
-        for point in *start..*end {
-            edge_of[point] = edge as u64;
-            index_of[point] = (point - start) as u64;
+        for at in *start as usize..*end as usize {
+            row.start(at, point(&along, at), &lattice);
+            row.push(ObjectValue::U64(edge as u64));
+            row.push(ObjectValue::U32((at - *start as usize) as u32));
+            row.graph_columns(&carried, at);
+            table.push(&row.values)?;
         }
     }
-    let mut table = Builder::new("point_id", along.len(), unit);
-    table.reserve(2 + widths(graph.along_names().into_iter().map(|n| graph.along(n)), 1));
-    table.positions(&along, &lattice);
-    table.integers("edge_id", DType::U64, edge_of.into_iter());
-    table.integers("index", DType::U32, index_of.into_iter());
-    table.graph_columns(
-        graph
-            .along_names()
-            .into_iter()
-            .filter_map(|n| graph.along(n).map(|c| (n, c))),
-        &["coordinates"],
-        unit,
-    )?;
-    table.write(
-        &roots.edge_points,
-        "point_id",
-        geometry,
-        extension("edge_points"),
-    )?;
+    finish(table, &roots.edge_points)?;
     Ok(roots)
+}
+
+fn check_points(column: &ColumnRead<'_>) -> Result<()> {
+    if column.width() != 3 {
+        return Err(Error::invalid(format!(
+            "a column of width {} is not a list of 3-vectors.",
+            column.width()
+        )));
+    }
+    Ok(())
+}
+
+/// Write a table at `root`, replacing what is there.
+fn finish(table: ObjectTableBuilder, root: &Path) -> Result<TableReader> {
+    if root.exists() {
+        fs::remove_dir_all(root).map_err(Error::backend)?;
+    }
+    table.finish(root)
 }

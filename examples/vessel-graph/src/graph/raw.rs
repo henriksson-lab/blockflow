@@ -17,6 +17,7 @@
 //! otherwise give a well-formed graph with permuted ids.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use blockflow::assemble::{Assembly, PlanBuilder};
 use blockflow::env::ArrayEnvironment;
@@ -57,7 +58,9 @@ impl Default for BuildParams {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawGraph {
     volume: [usize; 3],
-    coordinates: Vec<[u32; 3]>,
+    /// Shared with the vessel graph assembled from it, which reads its
+    /// carried columns through them.
+    coordinates: Arc<Vec<[u32; 3]>>,
     edges: Vec<[u32; 2]>,
 }
 
@@ -96,9 +99,107 @@ impl RawGraph {
         }
         Ok(Self {
             volume,
-            coordinates: narrow,
+            coordinates: Arc::new(narrow),
             edges,
         })
+    }
+
+    /// Assemble from a strictly ascending coordinate list and, per vertex, a
+    /// bit per step of `steps` (`blockflow::ops::adjacency::forward_offsets`,
+    /// at most 16) set where the voxel that step reaches is a vertex too: the
+    /// edges [`Self::assemble`] makes of the same mask's adjacent pairs, in
+    /// the same order (by lower endpoint, then by step, which is by higher
+    /// endpoint), without a list of pairs.
+    pub fn from_steps(
+        volume: [usize; 3],
+        coordinates: Vec<[u32; 3]>,
+        steps: &[[isize; 3]],
+        forward: &[u16],
+    ) -> Result<Self> {
+        if steps.len() > 16 || forward.len() != coordinates.len() {
+            return Err(Error::invalid(format!(
+                "{} step masks of {} steps for {} vertices.",
+                forward.len(),
+                steps.len(),
+                coordinates.len()
+            )));
+        }
+        for (axis, extent) in volume.iter().enumerate() {
+            if u32::try_from(*extent).is_err() {
+                return Err(Error::invalid(format!(
+                    "a volume of {extent} on axis {axis} does not fit a u32 coordinate."
+                )));
+            }
+        }
+        if let Some(window) = coordinates.windows(2).find(|window| window[0] >= window[1]) {
+            return Err(Error::invalid(format!(
+                "the vertex list is not strictly ascending: {:?} is followed by {:?}.",
+                window[0], window[1]
+            )));
+        }
+        if let Some(at) = coordinates
+            .iter()
+            .find(|at| (0..3).any(|axis| at[axis] as usize >= volume[axis]))
+        {
+            return Err(Error::invalid(format!(
+                "a coordinate at {at:?} is outside the volume {volume:?}."
+            )));
+        }
+        if u32::try_from(coordinates.len()).is_err() {
+            return Err(Error::invalid(format!(
+                "{} vertices do not fit a u32 vertex id.",
+                coordinates.len()
+            )));
+        }
+        let count = forward.iter().map(|mask| mask.count_ones() as usize).sum();
+        let mut edges = Vec::with_capacity(count);
+        for (vertex, (at, mask)) in coordinates.iter().zip(forward).enumerate() {
+            for (bit, step) in steps.iter().enumerate() {
+                if mask & (1 << bit) == 0 {
+                    continue;
+                }
+                let mut higher = [0u32; 3];
+                for axis in 0..3 {
+                    let moved = at[axis] as isize + step[axis];
+                    if moved < 0 || moved >= volume[axis] as isize {
+                        return Err(Error::invalid(format!(
+                            "vertex {at:?} has a neighbour {step:?} away, outside the volume."
+                        )));
+                    }
+                    higher[axis] = moved as u32;
+                }
+                // A step is lexicographically positive, so the neighbour is
+                // later in the list.
+                let later = &coordinates[vertex + 1..];
+                let found = match later.first() == Some(&higher) {
+                    true => Ok(0),
+                    false => later.binary_search(&higher),
+                };
+                let found = found.map_err(|_| {
+                    Error::invalid(format!(
+                        "vertex {at:?} names a neighbour at {higher:?}, which is not in the \
+                         vertex list. The two must come from the same mask."
+                    ))
+                })?;
+                edges.push([vertex as u32, (vertex + 1 + found) as u32]);
+            }
+        }
+        Ok(Self {
+            volume,
+            coordinates: Arc::new(coordinates),
+            edges,
+        })
+    }
+
+    /// The coordinates, shared.
+    pub(crate) fn shared_coordinates(&self) -> Arc<Vec<[u32; 3]>> {
+        Arc::clone(&self.coordinates)
+    }
+
+    /// Let the edges go: what is left is what a vessel graph is assembled
+    /// from once the graph has been cleaned.
+    pub(crate) fn drop_edges(&mut self) {
+        self.edges = Vec::new();
     }
 
     pub fn volume(&self) -> [usize; 3] {

@@ -35,15 +35,17 @@ use blockflow::error::{Error, Result};
 use blockflow::ome_zarr::OmeVolumePyramid;
 use blockflow::region::Region;
 use blockflow::voxels::{VoxelElement, Voxels};
-use blockflow::zarr_env::{chunk_for_block, PhysicalFrame};
+use blockflow::zarr_env::{chunk_for_extent, PhysicalFrame};
 use blockflow::Dtype;
 use ndarray::{Array3, Axis};
 use serde_json::Value;
 
 use crate::fuse::{fuse_region, FuseParams, PlacedSource, Placement};
 use crate::io::read_tile;
-use crate::planned::{fuse_planned, stored_chunk, PlannedStats, TileSource};
-use crate::pyramid::{pyramid_factors, slab_rows, sweep_axis, PyramidWriter};
+use crate::planned::{
+    fuse_planned_boxes, fuse_to_pyramid, stored, stored_chunk, PlannedStats, TileSource,
+};
+use crate::pyramid::{pyramid_factors, slab_rows, sweep_axis};
 use crate::wobbly::SourceStatus;
 
 /// One tile of a stored layout.
@@ -404,21 +406,22 @@ impl StoredLayout {
         let (sources, dtype) = self.tile_sources(channel, level)?;
         let shape = [region.shape[0], region.shape[1], region.shape[2]];
         let axis = sweep_axis(shape, dtype);
-        let chunk = chunk_for_block(shape, dtype);
+        let chunk = chunk_for_extent(shape, dtype);
         let rows = slab_rows(shape, chunk, axis, dtype);
         blockflow::dtype_dispatch!(
             dtype,
             |Element| {
                 let mut out = Array3::<Element>::from_elem(shape, Element::from_f64(0.0));
                 let mut at = 0;
-                fuse_planned::<Element>(
+                fuse_planned_boxes::<Element, _>(
                     params,
                     &placement,
-                    &sources,
+                    &stored::<Element>(&placement, &sources),
                     &region,
                     axis,
                     rows,
                     chunk,
+                    true,
                     |slab| {
                         let n = slab.len_of(Axis(axis));
                         out.slice_axis_mut(Axis(axis), ndarray::Slice::from(at..at + n))
@@ -458,30 +461,11 @@ impl StoredLayout {
         let placement = self.placement(None)?;
         let (sources, dtype) = self.tile_sources(channel, level)?;
         let shape = [region.shape[0], region.shape[1], region.shape[2]];
-        let axis = sweep_axis(shape, dtype);
         let factors = pyramid_factors(shape, levels);
-        blockflow::dtype_dispatch!(
-            dtype,
-            |Element| {
-                let mut writer =
-                    PyramidWriter::<Element>::create(root, shape, &factors, axis, Some(frame))?;
-                let chunk = writer.chunk();
-                let rows = slab_rows(shape, chunk, axis, dtype);
-                let stats = fuse_planned::<Element>(
-                    params,
-                    &placement,
-                    &sources,
-                    &region,
-                    axis,
-                    rows,
-                    chunk,
-                    |slab| writer.push(slab),
-                )?;
-                writer.finish()?;
-                Ok((stats, shape))
-            },
-            f16 => Err(Error::invalid("float16 tiles cannot be fused"))
-        )
+        let stats = fuse_to_pyramid(
+            params, &placement, &sources, dtype, &region, root, &factors, frame,
+        )?;
+        Ok((stats, shape))
     }
 
     /// The fusion before it was planned: every tile's planes that reach into

@@ -40,6 +40,16 @@
 //! the largest), so blocks queue for the network and each one runs on every
 //! core, in a thread pool of its own.
 //!
+//! **On a GPU** (the `deep-fill-cuda` or `deep-fill-wgpu` feature, chosen at
+//! run time by [`DeepFillDevice`]; the `gpu` module has the network) blocks
+//! queue for one thread that drives the device, so one block is on it at a
+//! time. Its
+//! memory is its own cap: `blockflow::gpu`'s device budget (three quarters
+//! of the device, `BLOCKFLOW_GPU_MEMORY`), which a block's forward pass
+//! leases while it runs and which the deep-fill block is halved to fit
+//! (`DeepFillModel::fit_block`). Host memory is the planner's as on the
+//! CPU: a block's buffers, a fraction of the CPU network's.
+//!
 //! The network itself is behind the `deep-fill` cargo feature (it needs burn);
 //! without it [`DeepFillParams`] and the CLI options exist but running one is
 //! refused. The weights are not part of this crate: they are the reference's
@@ -53,11 +63,15 @@ use std::path::PathBuf;
 
 use blockflow::{Error, Result};
 
+#[cfg(feature = "deep-fill-gpu")]
+pub mod gpu;
 #[cfg(feature = "deep-fill")]
 pub mod network;
 #[cfg(feature = "deep-fill")]
 mod op;
 
+#[cfg(feature = "deep-fill-gpu")]
+pub use gpu::GpuNetwork;
 #[cfg(feature = "deep-fill")]
 pub use op::{DeepFillModel, DeepFillOp};
 
@@ -133,15 +147,64 @@ pub enum DeepFillOutput {
     Probability,
 }
 
-/// Where the weights are and how the deep-fill phases are cut; shared by
-/// every channel of a run.
+/// Where the network runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeepFillDevice {
+    /// burn's CPU backend, every core.
+    Cpu,
+    /// The GPU, and an error when this build has no GPU runtime or none is
+    /// reachable.
+    Gpu,
+    /// The GPU when this build has a runtime and a device is reachable,
+    /// otherwise the CPU. The default.
+    #[default]
+    Auto,
+}
+
+impl DeepFillDevice {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim() {
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            "auto" => Ok(Self::Auto),
+            other => Err(Error::invalid(format!(
+                "deep fill: device `{other}` is not one of cpu, gpu, auto"
+            ))),
+        }
+    }
+
+    /// `Cpu` or `Gpu`: where a run with this choice puts the network, or why
+    /// it cannot.
+    pub fn resolve(self) -> Result<Self> {
+        let reachable = GPU_BUILD && blockflow::gpu::available();
+        match self {
+            Self::Cpu => Ok(Self::Cpu),
+            Self::Auto => Ok(if reachable { Self::Gpu } else { Self::Cpu }),
+            Self::Gpu if reachable => Ok(Self::Gpu),
+            Self::Gpu if !GPU_BUILD => Err(Error::invalid(
+                "deep fill: --deep-fill-device gpu needs a build with the `deep-fill-cuda` \
+                 (or `deep-fill-wgpu`) feature",
+            )),
+            Self::Gpu => Err(Error::invalid(
+                "deep fill: --deep-fill-device gpu, and no GPU is reachable (no device or \
+                 driver, or BLOCKFLOW_GPU=off); use cpu or auto",
+            )),
+        }
+    }
+}
+
+/// Where the weights are, where the network runs and how the deep-fill
+/// phases are cut; shared by every channel of a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepFillSetup {
     /// The weights (safetensors); `None` reads [`WEIGHTS_VARIABLE`].
     pub weights: Option<PathBuf>,
     /// Block edge of the deep-fill phases, z, y, x (clamped to the volume).
     /// Each block is read with its halo and run through the network whole.
+    /// On a GPU the block is halved along its longest axis until a block's
+    /// forward pass fits the device budget.
     pub block: [usize; 3],
+    pub device: DeepFillDevice,
 }
 
 impl Default for DeepFillSetup {
@@ -149,6 +212,7 @@ impl Default for DeepFillSetup {
         Self {
             weights: None,
             block: [256, 512, 512],
+            device: DeepFillDevice::Auto,
         }
     }
 }
@@ -175,6 +239,10 @@ impl DeepFillSetup {
 /// Whether this build can run the network.
 pub const AVAILABLE: bool = cfg!(feature = "deep-fill");
 
+/// Whether this build can run the network on a GPU (`deep-fill-cuda` or
+/// `deep-fill-wgpu`).
+pub const GPU_BUILD: bool = cfg!(feature = "deep-fill-gpu");
+
 /// Append the deep filling of `mask` (`Bool`) as one pixel phase on its own
 /// block grid; the grid is restored afterwards.
 pub fn append_deep_fill(
@@ -190,10 +258,11 @@ pub fn append_deep_fill(
         use blockflow::geometry::BlockGrid;
         use blockflow::op::Chain;
 
-        let model = DeepFillModel::shared(&setup.weights_path()?)?;
+        let model = DeepFillModel::shared(&setup.weights_path()?, setup.device.resolve()?)?;
         let grid = c.plan.grid().clone();
         let volume = grid.volume();
-        c.plan.regrid(BlockGrid::new(volume, setup.block)?);
+        let block = model.fit_block(setup.block, volume, params);
+        c.plan.regrid(BlockGrid::new(volume, block)?);
         let op = DeepFillOp::new(model, *params, output);
         let filled = c.pixels(c.on(mask, vec![Chain::op(op)]));
         c.plan.regrid(grid);

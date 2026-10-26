@@ -135,12 +135,12 @@ pub mod dtype;
 pub mod env;
 pub mod error;
 pub mod export;
+pub mod feature_index;
 /// Ops whose input or output is not a pixel region: `volume -> fragments`,
 /// `fragments -> fragments` and `fragments -> volume`, scheduled by the same
 /// executor over the same task DAG. A second trait beside `BlockOp`, because
 /// they are a different shape rather than a wider signature.
 pub mod forest;
-pub mod feature_index;
 pub mod fragment;
 pub mod geometry;
 /// GPU implementations of block ops, selected at run time beside the CPU

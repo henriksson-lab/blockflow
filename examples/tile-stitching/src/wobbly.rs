@@ -41,6 +41,7 @@ use rayon::prelude::*;
 use crate::place::{AlignmentSlot, SourceSlab, WobblyLayout};
 use crate::plane::PlaneGeometry;
 use crate::solve::round_even;
+use crate::tiles::{admitted, BoxAt, KeptPair, TileBoxes};
 
 // --------------------------------------------------------------- vocabulary --
 
@@ -986,14 +987,133 @@ pub struct Measurement {
     pub measured: usize,
 }
 
-fn axis_projection(planes: &[Array2<f64>], local: usize, slab: (usize, usize)) -> Array2<f64> {
-    let start = local.saturating_sub(slab.0);
-    let stop = (local + slab.1 + 1).min(planes.len());
-    let mut out = planes[start].clone();
-    for plane in &planes[start + 1..stop] {
-        out.zip_mut_with(plane, |left, &right| *left = left.max(right));
+/// A stack of cut planes, one per wobble-axis coordinate of an overlap, read
+/// as `f64` plane by plane: held planes, or planes taken from a tile box as
+/// they are wanted, so a pair need not hold its stacks in `f64`.
+pub trait CutStack: Sync {
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
-    out
+
+    /// Plane `index`'s extent.
+    fn dim(&self, index: usize) -> (usize, usize);
+
+    /// Plane `index` as stored, before any preparation.
+    fn plane(&self, index: usize) -> Array2<f64>;
+
+    /// Every value of plane `index` in [`Self::plane`]'s order (rows, then
+    /// columns), without holding the plane.
+    fn visit(&self, index: usize, f: &mut dyn FnMut(f64)) {
+        self.plane(index).iter().for_each(|&value| f(value));
+    }
+}
+
+impl CutStack for [Array2<f64>] {
+    fn len(&self) -> usize {
+        <[Array2<f64>]>::len(self)
+    }
+
+    fn dim(&self, index: usize) -> (usize, usize) {
+        self[index].dim()
+    }
+
+    fn plane(&self, index: usize) -> Array2<f64> {
+        self[index].clone()
+    }
+}
+
+/// The planes of a tile box across `axis`, widened to `f64` when read.
+pub struct BoxCuts<'a, T> {
+    pub view: ArrayView3<'a, T>,
+    pub axis: usize,
+}
+
+impl<T: VoxelElement> CutStack for BoxCuts<'_, T> {
+    fn len(&self) -> usize {
+        self.view.len_of(ndarray::Axis(self.axis))
+    }
+
+    fn dim(&self, _index: usize) -> (usize, usize) {
+        let kept: Vec<usize> = (0..3)
+            .filter(|&a| a != self.axis)
+            .map(|a| self.view.len_of(ndarray::Axis(a)))
+            .collect();
+        (kept[0], kept[1])
+    }
+
+    fn plane(&self, index: usize) -> Array2<f64> {
+        self.view
+            .index_axis(ndarray::Axis(self.axis), index)
+            .mapv(|value| value.into_f64())
+    }
+
+    fn visit(&self, index: usize, f: &mut dyn FnMut(f64)) {
+        self.view
+            .index_axis(ndarray::Axis(self.axis), index)
+            .iter()
+            .for_each(|value| f(value.into_f64()));
+    }
+}
+
+/// [`stack_statistics`] of a [`CutStack`], reading each plane twice (once per
+/// sum) in the same order, so the figures are the same.
+fn stack_statistics_of(stack: &(impl CutStack + ?Sized)) -> (f64, f64) {
+    fn add(total: &mut f64, compensation: &mut f64, term: f64) {
+        let sum = *total + term;
+        *compensation += if total.abs() >= term.abs() {
+            (*total - sum) + term
+        } else {
+            (term - sum) + *total
+        };
+        *total = sum;
+    }
+    let (mut total, mut compensation, mut count) = (0.0, 0.0, 0usize);
+    for index in 0..stack.len() {
+        stack.visit(index, &mut |value| {
+            add(&mut total, &mut compensation, value);
+            count += 1;
+        });
+    }
+    let mean = if count == 0 {
+        0.0
+    } else {
+        (total + compensation) / count as f64
+    };
+    let (mut energy, mut energy_compensation) = (0.0, 0.0);
+    for index in 0..stack.len() {
+        stack.visit(index, &mut |value| {
+            let centred = value - mean;
+            add(&mut energy, &mut energy_compensation, centred * centred);
+        });
+    }
+    (mean, (energy + energy_compensation).sqrt())
+}
+
+/// The foreground and total counts of plane `index` of `stack`.
+fn plane_counts<S: CutStack + ?Sized>(
+    validation: Foreground,
+    stack: &S,
+    index: usize,
+) -> (usize, usize) {
+    let (mut foreground, mut total) = (0usize, 0usize);
+    stack.visit(index, &mut |value| {
+        total += 1;
+        foreground += usize::from(validation.counts(value));
+    });
+    (foreground, total)
+}
+
+/// Whether the stack validation refuses a whole stack.
+fn stack_rejects<S: CutStack + ?Sized>(validation: Foreground, stack: &S) -> bool {
+    let (mut foreground, mut total) = (0usize, 0usize);
+    for index in 0..stack.len() {
+        let (f, t) = plane_counts(validation, stack, index);
+        foreground += f;
+        total += t;
+    }
+    !validation.accepts_count(foreground, total)
 }
 
 /// One pair's measurement from its two cut stacks: one plane per wobble-axis
@@ -1002,8 +1122,21 @@ fn axis_projection(planes: &[Array2<f64>], local: usize, slab: (usize, usize)) -
 /// `plane_offset` is `post.position - pre.position` on the two plane axes; it
 /// turns a shift into a displacement.
 pub fn measure_wobbly_axis(
-    mut cut_a: Vec<Array2<f64>>,
-    mut cut_b: Vec<Array2<f64>>,
+    cut_a: Vec<Array2<f64>>,
+    cut_b: Vec<Array2<f64>>,
+    geometry: &PlaneGeometry,
+    plane_offset: [isize; 2],
+    params: &MeasureParams,
+) -> Result<Measurement> {
+    measure_stacks(&cut_a[..], &cut_b[..], geometry, plane_offset, params)
+}
+
+/// [`measure_wobbly_axis`] over any [`CutStack`]s: each plane is read when it
+/// is wanted (and centred and scaled by its stack's mean and norm then), so
+/// only the planes being measured are held in `f64`.
+pub fn measure_stacks<A: CutStack + ?Sized, B: CutStack + ?Sized>(
+    cut_a: &A,
+    cut_b: &B,
     geometry: &PlaneGeometry,
     plane_offset: [isize; 2],
     params: &MeasureParams,
@@ -1016,12 +1149,16 @@ pub fn measure_wobbly_axis(
         )));
     }
     let (shape_a, shape_b) = (geometry.cut_shape_a(), geometry.cut_shape_b());
-    for (which, cut, shape) in [("first", &cut_a, shape_a), ("second", &cut_b, shape_b)] {
-        if let Some(index) = cut.iter().position(|p| p.dim() != (shape[0], shape[1])) {
-            return Err(Error::invalid(format!(
-                "cut plane {index} of the {which} tile is {:?}, not {shape:?}",
-                cut[index].dim()
-            )));
+    for index in 0..n_slices {
+        for (which, dim, shape) in [
+            ("first", cut_a.dim(index), shape_a),
+            ("second", cut_b.dim(index), shape_b),
+        ] {
+            if dim != (shape[0], shape[1]) {
+                return Err(Error::invalid(format!(
+                    "cut plane {index} of the {which} tile is {dim:?}, not {shape:?}"
+                )));
+            }
         }
     }
     let [rows, cols] = geometry.landscape_shape();
@@ -1031,14 +1168,7 @@ pub fn measure_wobbly_axis(
         |shift: &Vec<isize>| vec![shift[0] + plane_offset[0], shift[1] + plane_offset[1]];
 
     let stack_rejected = params.stack_validation.is_some_and(|validation| {
-        [&cut_a, &cut_b].iter().any(|cut| {
-            let total = cut.iter().map(|plane| plane.len()).sum::<usize>();
-            let foreground = cut
-                .iter()
-                .map(|plane| validation.count(plane.iter().copied()))
-                .sum::<usize>();
-            !validation.accepts_count(foreground, total)
-        })
+        stack_rejects(validation, cut_a) || stack_rejects(validation, cut_b)
     });
     if stack_rejected {
         // No signal at all: every slice keeps the rigid offset.
@@ -1056,8 +1186,7 @@ pub fn measure_wobbly_axis(
         });
     }
 
-    // Which slices are measured, and the slice validation on the raw planes
-    // (the preparation overwrites them).
+    // Which slices are measured, and the slice validation on the raw planes.
     let step = params.slice_step.max(1);
     let mut to_measure = Vec::new();
     for (index, state) in status.iter_mut().enumerate() {
@@ -1066,9 +1195,10 @@ pub fn measure_wobbly_axis(
             continue;
         }
         if let Some(validation) = params.slice_validation {
-            let ok = [&cut_a[index], &cut_b[index]].iter().all(|plane| {
-                validation.accepts_count(validation.count(plane.iter().copied()), plane.len())
-            });
+            let accepts =
+                |(foreground, total): (usize, usize)| validation.accepts_count(foreground, total);
+            let ok = accepts(plane_counts(validation, cut_a, index))
+                && accepts(plane_counts(validation, cut_b, index));
             if !ok {
                 *state = AlignmentStatus::NO_SIGNAL;
                 continue;
@@ -1077,10 +1207,33 @@ pub fn measure_wobbly_axis(
         to_measure.push(index);
     }
 
-    if params.prepare {
-        prepare_normalization(&mut cut_a);
-        prepare_normalization(&mut cut_b);
-    }
+    // The stacks' own mean and norm, applied to each plane as it is read.
+    let scaling = |stack: &dyn Fn() -> (f64, f64)| {
+        params.prepare.then(|| {
+            let (mean, norm) = stack();
+            (mean, if norm == 0.0 { 0.0 } else { 1.0 / norm })
+        })
+    };
+    let scale_a = scaling(&|| stack_statistics_of(cut_a));
+    let scale_b = scaling(&|| stack_statistics_of(cut_b));
+    let prepared = |plane: Array2<f64>, scale: Option<(f64, f64)>| match scale {
+        None => plane,
+        Some((mean, scale)) => {
+            let mut plane = plane;
+            plane.mapv_inplace(|value| (value - mean) * scale);
+            plane
+        }
+    };
+    let projected = |stack: &dyn Fn(usize) -> Array2<f64>, local: usize, slab: (usize, usize)| {
+        let start = local.saturating_sub(slab.0);
+        let stop = (local + slab.1 + 1).min(n_slices);
+        let mut out = stack(start);
+        for index in start + 1..stop {
+            let plane = stack(index);
+            out.zip_mut_with(&plane, |left, &right| *left = left.max(right));
+        }
+        out
+    };
 
     let plan = SquaredDifference::new(shape_a, shape_b, geometry.window()?, Padding::Smooth)?;
     let measured = to_measure
@@ -1088,11 +1241,13 @@ pub fn measure_wobbly_axis(
         .map_init(
             || plan.clone(),
             |plan, &index| -> Result<(usize, Array2<f64>)> {
+                let plane_a = |i: usize| prepared(cut_a.plane(i), scale_a);
+                let plane_b = |i: usize| prepared(cut_b.plane(i), scale_b);
                 let (mut a, mut b) = match params.axis_mip {
-                    None => (cut_a[index].clone(), cut_b[index].clone()),
+                    None => (plane_a(index), plane_b(index)),
                     Some(slab) => (
-                        axis_projection(&cut_a, index, slab),
-                        axis_projection(&cut_b, index, slab),
+                        projected(&plane_a, index, slab),
+                        projected(&plane_b, index, slab),
                     ),
                 };
                 if params.prepare_slice {
@@ -1144,6 +1299,180 @@ pub fn measure_layout<T: VoxelElement>(
     axis: usize,
     params: &MeasureParams,
 ) -> Result<WobblyLayout> {
+    measure_layout_boxes(positions, pairs, tiles, axis, params)
+}
+
+/// One pair's cuts: the plane geometry, the planes along the wobble axis
+/// both tiles span, and where they start in each tile.
+struct PairCut {
+    geometry: PlaneGeometry,
+    start: isize,
+    stop: isize,
+}
+
+fn pair_cut(
+    positions: &[[isize; 3]],
+    shapes: &[[usize; 3]],
+    (pre, post): (usize, usize),
+    axis: usize,
+    plane: [usize; 2],
+    params: &MeasureParams,
+) -> Result<PairCut> {
+    if pre >= shapes.len() || post >= shapes.len() {
+        return Err(Error::invalid(format!(
+            "pair ({pre}, {post}) names a tile beyond the {} given",
+            shapes.len()
+        )));
+    }
+    let (a_pos, b_pos) = (positions[pre], positions[post]);
+    let (a_shape, b_shape) = (shapes[pre], shapes[post]);
+    let geometry = PlaneGeometry::new(
+        plane.map(|p| a_pos[p]),
+        plane.map(|p| a_shape[p]),
+        plane.map(|p| b_pos[p]),
+        plane.map(|p| b_shape[p]),
+        params.max_shifts,
+    )?;
+    let start = a_pos[axis].max(b_pos[axis]);
+    let stop = (a_pos[axis] + a_shape[axis] as isize).min(b_pos[axis] + b_shape[axis] as isize);
+    if stop <= start {
+        return Err(Error::invalid(format!(
+            "tiles {pre} and {post} do not overlap along axis {axis}: {start} to {stop}"
+        )));
+    }
+    Ok(PairCut {
+        geometry,
+        start,
+        stop,
+    })
+}
+
+/// The plane axes of a wobble axis.
+fn plane_axes(axis: usize) -> [usize; 2] {
+    match axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    }
+}
+
+/// The box of a tile a cut covers: `ranges` on the plane axes, planes
+/// `first..first + n` along the wobble axis.
+fn cut_box(
+    axis: usize,
+    plane: [usize; 2],
+    ranges: [(usize, usize); 2],
+    first: usize,
+    n: usize,
+) -> BoxAt {
+    let mut start = [0usize; 3];
+    let mut shape = [0usize; 3];
+    start[axis] = first;
+    shape[axis] = n;
+    for (d, &p) in plane.iter().enumerate() {
+        start[p] = ranges[d].0;
+        shape[p] = ranges[d].1 - ranges[d].0;
+    }
+    (start, shape)
+}
+
+/// For each pair, boxes of its two tiles (`pre`, then `post`) holding the cut
+/// boxes [`measure_layout_boxes`] reads at any positions whose difference
+/// (`post - pre`) is within `margins[pair][axis]` (inclusive) of its
+/// difference at `positions`: what to read ahead before the positions are
+/// final. `None` for a pair with no such box.
+pub fn cut_boxes_within(
+    positions: &[[isize; 3]],
+    pairs: &[(usize, usize)],
+    shapes: &[[usize; 3]],
+    axis: usize,
+    params: &MeasureParams,
+    margins: &[[(isize, isize); 3]],
+) -> Vec<Option<[BoxAt; 2]>> {
+    if axis > 2 || positions.len() != shapes.len() {
+        return vec![None; pairs.len()];
+    }
+    let plane = plane_axes(axis);
+    pairs
+        .iter()
+        .zip(margins)
+        .map(|(&(pre, post), margin)| {
+            if pre >= shapes.len() || post >= shapes.len() {
+                return None;
+            }
+            // A move of `post` by `d` is a shift of the search range by `d`.
+            let widened: [[isize; 2]; 2] = std::array::from_fn(|d| {
+                let p = plane[d];
+                [
+                    params.max_shifts[d][0] + margin[p].0,
+                    params.max_shifts[d][1] + margin[p].1,
+                ]
+            });
+            let (a, b) = (positions[pre], positions[post]);
+            let (sa, sb) = (shapes[pre], shapes[post]);
+            let geometry = PlaneGeometry::new(
+                plane.map(|p| a[p]),
+                plane.map(|p| sa[p]),
+                plane.map(|p| b[p]),
+                plane.map(|p| sb[p]),
+                widened,
+            )
+            .ok()?;
+            // Along the wobble axis, the union of the spans both tiles share.
+            let (low, high) = margin[axis];
+            let start = a[axis].max(b[axis] + low);
+            let stop = (a[axis] + sa[axis] as isize).min(b[axis] + sb[axis] as isize + high);
+            let start_b = b[axis].max(a[axis] - high);
+            let stop_b = (b[axis] + sb[axis] as isize).min(a[axis] + sa[axis] as isize - low);
+            if stop <= start || stop_b <= start_b {
+                return None;
+            }
+            Some([
+                cut_box(
+                    axis,
+                    plane,
+                    geometry.cut_a,
+                    (start - a[axis]) as usize,
+                    (stop - start) as usize,
+                ),
+                cut_box(
+                    axis,
+                    plane,
+                    geometry.cut_b,
+                    (start_b - b[axis]) as usize,
+                    (stop_b - start_b) as usize,
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// [`measure_layout`] reading each pair's cuts from `tiles`, pairs in
+/// parallel as the memory cap allows ([`crate::tiles::admitted`]): a pair
+/// holds its two cut boxes, their `f64` planes and its landscapes while it is
+/// measured.
+pub fn measure_layout_boxes<T: VoxelElement, B: TileBoxes<T> + ?Sized>(
+    positions: &[[isize; 3]],
+    pairs: &[(usize, usize)],
+    tiles: &B,
+    axis: usize,
+    params: &MeasureParams,
+) -> Result<WobblyLayout> {
+    measure_layout_kept(positions, pairs, tiles, axis, params, Vec::new())
+}
+
+/// [`measure_layout_boxes`], cutting a pair from the boxes `kept[pair]` (read
+/// by an earlier step, [`crate::rigid::align_layout_keeping`]) where they hold
+/// its cuts, and reading them otherwise. A kept pair is let go as soon as it
+/// is measured, or at once if it does not hold the cuts.
+pub fn measure_layout_kept<'a, T: VoxelElement, B: TileBoxes<T> + ?Sized>(
+    positions: &[[isize; 3]],
+    pairs: &[(usize, usize)],
+    tiles: &'a B,
+    axis: usize,
+    params: &MeasureParams,
+    kept: Vec<Option<KeptPair<'a, T>>>,
+) -> Result<WobblyLayout> {
     if positions.len() != tiles.len() {
         return Err(Error::invalid(format!(
             "{} positions for {} tiles",
@@ -1156,66 +1485,89 @@ pub fn measure_layout<T: VoxelElement>(
             "the wobble axis is {axis} and a volume has three"
         )));
     }
-    let shapes = tiles
-        .iter()
-        .map(|tile| [tile.shape()[0], tile.shape()[1], tile.shape()[2]])
+    let shapes = (0..tiles.len())
+        .map(|tile| tiles.shape(tile))
         .collect::<Vec<_>>();
-    let plane: [usize; 2] = match axis {
-        0 => [1, 2],
-        1 => [0, 2],
-        _ => [0, 1],
+    let plane = plane_axes(axis);
+    // The two cut boxes of a pair, over the planes both tiles span.
+    let boxes = |cut: &PairCut, (pre, post): (usize, usize)| -> [BoxAt; 2] {
+        let n = (cut.stop - cut.start) as usize;
+        [
+            cut_box(
+                axis,
+                plane,
+                cut.geometry.cut_a,
+                (cut.start - positions[pre][axis]) as usize,
+                n,
+            ),
+            cut_box(
+                axis,
+                plane,
+                cut.geometry.cut_b,
+                (cut.start - positions[post][axis]) as usize,
+                n,
+            ),
+        ]
     };
-    let mut alignments = Vec::with_capacity(pairs.len());
-    for &(pre, post) in pairs {
-        if pre >= tiles.len() || post >= tiles.len() {
-            return Err(Error::invalid(format!(
-                "pair ({pre}, {post}) names a tile beyond the {} given",
-                tiles.len()
-            )));
-        }
-        let (a_pos, b_pos) = (positions[pre], positions[post]);
-        let (a_shape, b_shape) = (shapes[pre], shapes[post]);
-        let geometry = PlaneGeometry::new(
-            plane.map(|p| a_pos[p]),
-            plane.map(|p| a_shape[p]),
-            plane.map(|p| b_pos[p]),
-            plane.map(|p| b_shape[p]),
-            params.max_shifts,
-        )?;
-        let start = a_pos[axis].max(b_pos[axis]);
-        let stop = (a_pos[axis] + a_shape[axis] as isize).min(b_pos[axis] + b_shape[axis] as isize);
-        if stop <= start {
-            return Err(Error::invalid(format!(
-                "tiles {pre} and {post} do not overlap along axis {axis}: {start} to {stop}"
-            )));
-        }
-        let cut = |tile: &ArrayView3<'_, T>, ranges: [(usize, usize); 2], first: isize| {
-            (0..(stop - start) as usize)
-                .map(|slice| {
-                    let shape = (ranges[0].1 - ranges[0].0, ranges[1].1 - ranges[1].0);
-                    Array2::from_shape_fn(shape, |(row, column)| {
-                        let mut at = [0usize; 3];
-                        at[axis] = (first + slice as isize) as usize;
-                        at[plane[0]] = ranges[0].0 + row;
-                        at[plane[1]] = ranges[1].0 + column;
-                        tile[at].into_f64()
-                    })
+    // Each pair with what was kept for it, if that holds its cuts; the rest
+    // is let go now.
+    let mut kept = kept.into_iter();
+    let items = pairs
+        .iter()
+        .map(|&pair| {
+            let held = kept.next().flatten().filter(|held| {
+                pair_cut(positions, &shapes, pair, axis, plane, params).is_ok_and(|cut| {
+                    let [a, b] = boxes(&cut, pair);
+                    held.pre.covers(a) && held.post.covers(b)
                 })
-                .collect::<Vec<_>>()
+            });
+            (pair, held)
+        })
+        .collect::<Vec<_>>();
+    drop(kept);
+    let workers = rayon::current_num_threads() as u64;
+    let bytes = |((pre, post), held): &((usize, usize), Option<KeptPair<'a, T>>)| -> u64 {
+        let Ok(cut) = pair_cut(positions, &shapes, (*pre, *post), axis, plane, params) else {
+            return 0;
         };
-        let measurement = measure_wobbly_axis(
-            cut(&tiles[pre], geometry.cut_a, start - a_pos[axis]),
-            cut(&tiles[post], geometry.cut_b, start - b_pos[axis]),
-            &geometry,
-            plane.map(|p| b_pos[p] - a_pos[p]),
+        let n = (cut.stop - cut.start) as usize;
+        let [(_, a), (_, b)] = boxes(&cut, (*pre, *post));
+        let plane = |shape: [usize; 3]| (shape.iter().product::<usize>() / n.max(1)) as u64;
+        let [rows, cols] = cut.geometry.landscape_shape();
+        // The boxes as read (unless they were kept, and leased then), a
+        // landscape per plane, and the planes each worker holds in `f64`
+        // while it measures one (both tiles', prepared and padded).
+        let read = if held.is_some() {
+            0
+        } else {
+            tiles.read_bytes(a) + tiles.read_bytes(b)
+        };
+        read + 8 * (n * rows * cols) as u64 + workers * 4 * 8 * (plane(a) + plane(b))
+    };
+    let alignments = admitted(items, bytes, tiles.ceiling(), |((pre, post), held)| {
+        let cut = pair_cut(positions, &shapes, (pre, post), axis, plane, params)?;
+        let [a, b] = boxes(&cut, (pre, post));
+        let read;
+        let (view_a, view_b) = match &held {
+            Some(held) => (held.pre.view_of(a), held.post.view_of(b)),
+            None => {
+                read = [tiles.read(pre, a.0, a.1)?, tiles.read(post, b.0, b.1)?];
+                (read[0].view(), read[1].view())
+            }
+        };
+        let measurement = measure_stacks(
+            &BoxCuts { view: view_a, axis },
+            &BoxCuts { view: view_b, axis },
+            &cut.geometry,
+            plane.map(|p| positions[post][p] - positions[pre][p]),
             params,
         )?;
-        alignments.push(AlignmentSlot {
+        Ok(AlignmentSlot {
             pre,
             post,
             track: measurement.track,
-        });
-    }
+        })
+    })?;
     Ok(WobblyLayout {
         sources: positions
             .iter()

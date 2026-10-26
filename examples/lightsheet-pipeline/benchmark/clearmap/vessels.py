@@ -21,7 +21,7 @@ search radii), `clean_graph` and `reduce_graph` with the orchestrator's
 mappings. No atlas step (the blockflow side runs `graph` without
 `--registration` too).
 
-    vessels.py --inputs DIR --out DIR --processes N [--spacing X,Y,Z] [--deep-fill [--eval]]
+    vessels.py --inputs DIR --out DIR --processes N [--spacing X,Y,Z] [--deep-fill [--eval] [--device cpu|cuda]]
 
 `--inputs` holds `source_c0.npy` and `source_c1.npy` from `prepare.py
 channels` (`(x, y, z)`). Every intermediate is a `.npy` file in `--out`, as
@@ -114,11 +114,15 @@ def fill(source, sink, processes):
     return sink
 
 
-def deep_fill(source, sink, role, evaluation, threads):
+def deep_fill(source, sink, role, evaluation, threads, device="cpu"):
     import torch
     import ClearMap.ImageProcessing.machine_learning.vessel_filling.vessel_filling as vessel_filling
     torch.set_num_threads(threads)
-    network = vessel_filling.vessel_filling_network(cuda=False).float()
+    cuda = device == "cuda"
+    # On CUDA the network as the reference's orchestrator loads it (float16).
+    network = vessel_filling.vessel_filling_network(cuda=cuda)
+    if not cuda:
+        network = network.float()
     if evaluation:
         network.eval()
     settings = ROLES[role]["deep_fill"]
@@ -126,7 +130,7 @@ def deep_fill(source, sink, role, evaluation, threads):
     processing.update(size_max=settings["size_max"], size_min="fixed", axes="all",
                       overlap=settings["overlap"])
     vessel_filling.fill_vessels(str(source), str(sink), resample=settings["resample"], threshold=0.5,
-                                network=network, cuda=False, processing_parameter=processing,
+                                network=network, cuda=cuda, processing_parameter=processing,
                                 verbose=False)
     return sink
 
@@ -139,6 +143,8 @@ def main():
     parser.add_argument("--spacing", default="1.625,1.625,1.6", help="x,y,z µm per voxel")
     parser.add_argument("--deep-fill", action="store_true")
     parser.add_argument("--eval", action="store_true", help="deep fill with dropout off")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu",
+                        help="where the deep filling's network runs")
     args = parser.parse_args()
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -156,7 +162,8 @@ def main():
         last[channel] = filled
         if args.deep_fill:
             last[channel] = steps.run(f"deep_fill_c{channel}", deep_fill, filled,
-                                      out / f"deep_filled_c{channel}.npy", role, args.eval, n)
+                                      out / f"deep_filled_c{channel}.npy", role, args.eval, n,
+                                      args.device)
 
     combined = out / "binary_combined.npy"
     steps.run("combine", block_processing.process, np.logical_or, [str(last[c]) for c, _ in CHANNELS],
@@ -224,6 +231,7 @@ def main():
     def count(path):
         return int(np.count_nonzero(np.load(path, mmap_mode="r")))
     record = {"processes": n, "deep_fill": args.deep_fill, "dropout": args.deep_fill and not args.eval,
+              "deep_fill_device": args.device if args.deep_fill else None,
               "spacing_xyz": spacing.tolist(), "steps_s": steps.seconds, "total_s": round(total, 3),
               "final_voxels": count(final), "skeleton_voxels": count(skeleton),
               "graph_raw": {"vertices": raw_counts[0], "edges": raw_counts[1]},

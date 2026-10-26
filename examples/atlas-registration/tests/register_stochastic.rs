@@ -641,6 +641,84 @@ fn a_partial_mosaic_is_placed_by_its_frame_or_an_initial_translation() {
     assert!(Initialisation::parse("landmarks").is_err());
 }
 
+/// The same strip with nothing placing it: the placement search finds the
+/// translation from the images, the fit started there lands on the strip,
+/// and the sidecar records the search. `parse("search")` selects it.
+#[test]
+fn a_partial_mosaic_is_placed_by_a_correlation_search() {
+    let scratch = Scratch::new("search");
+    write_crop(
+        &scratch.join("moving.zarr"),
+        2.0,
+        [48, 72, 80],
+        [0.0; 3],
+        [0.0; 3],
+    );
+    let strip = [0.0, 8.0, 48.0];
+    write_crop(
+        &scratch.join("unplaced.zarr"),
+        1.0,
+        [64, 32, 28],
+        [0.0; 3],
+        strip,
+    );
+    let search = match Initialisation::parse("search").unwrap() {
+        Initialisation::Search(params) => params,
+        other => panic!("{other:?}"),
+    };
+    let placement = blockflow_atlas_registration::pipeline::place(
+        &input(scratch.join("unplaced.zarr")),
+        &input(scratch.join("moving.zarr")),
+        Some([2.0; 3]),
+        &search,
+    )
+    .expect("placed");
+    for a in 0..3 {
+        assert!(
+            (placement.translation()[a] - strip[a]).abs() < 1.0,
+            "{:?} vs {strip:?}",
+            placement.translation()
+        );
+    }
+    register(&RegisterConfig {
+        fixed: input(scratch.join("unplaced.zarr")),
+        moving: input(scratch.join("moving.zarr")),
+        resolution: Some([2.0; 3]),
+        stages: vec![Stage::Stochastic(quick_translation(7))],
+        out: scratch.join("searched"),
+        warped: None,
+        warp_source: None,
+        nearest: false,
+        block: 16,
+        workers: 2,
+        warped_stages: false,
+        initialisation: Initialisation::Search(search),
+    })
+    .expect("registers");
+    let transform = PointTransform::from_registration_dir(scratch.join("searched")).unwrap();
+    let probes = [[20.0, 10.0, 10.0], [40.0, 20.0, 15.0], [32.0, 16.0, 20.0]];
+    for (got, probe) in transform.apply(&probes).iter().zip(&probes) {
+        for a in 0..3 {
+            let truth = (strip[a] + probe[a]) / 2.0;
+            assert!(
+                (got[a] - truth).abs() < 0.25,
+                "{got:?} vs {probe:?} (truth {truth})"
+            );
+        }
+    }
+    let sidecar: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scratch.join("searched").join("registration.json")).unwrap(),
+    )
+    .unwrap();
+    let recorded = &sidecar["initialisation"]["search"];
+    assert_eq!(
+        recorded["translation"],
+        serde_json::json!(placement.translation())
+    );
+    assert!(recorded["ncc"].as_f64().unwrap() > 0.9, "{recorded}");
+    assert!(sidecar["timings"]["place_s"].is_number());
+}
+
 #[test]
 fn a_directory_that_is_not_a_registration_is_refused() {
     let scratch = Scratch::new("empty");

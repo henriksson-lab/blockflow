@@ -79,11 +79,11 @@ and five arms OR-ed into one sink.
 | step | what | blockflow pieces |
 |---|---|---|
 | clip | raw `(400, 60000)` spread over 4096 bins, rounded; three masks of the raw range: saturated (`>= high`, seeds the sink), not-low (the median's population), in-range (the population of the window estimates) | `voxelwise` (`WidenOp`, `VoxelwiseMapOp`, `NarrowOp`, `VoxelwiseMaskOp`) |
-| lightsheet | `v - min(v, min(p25 along a 150-voxel x line, 2 x p25 of a 200 x 200 window))`, both estimates over the in-range voxels; the window on a 25-voxel lattice, stride 2 | `rank::MaskedRankFilterOp`, `local::LocalStatisticOp` (masked, sampled), `voxelwise::FnCombine` |
+| lightsheet | `v - min(v, min(p25 along a 150-voxel x line, 2 x p25 of a 200 x 200 window))`, both estimates over the in-range voxels; the window on a 25-voxel lattice, stride 2 | `rank::MaskedRankFilterOp`, `local::LocalStatisticOp` (masked, sampled) or `lattice_samples` (below), `voxelwise::FnCombine` |
 | median | 3 x 3 x 3 over the not-low voxels; dark voxels left at zero | `MaskedRankFilterOp` |
 | deconvolve arm | the sink's voxels blurred (σ 10 in y, x; flat in z) and subtracted outside the sink; residual `> 750` | `smooth::SmoothOp` (reflecting boundary), `FnCombine`, planned with `PlanBuilder::partition` |
-| adaptive arm | the deconvolved volume against a local isodata threshold (3 x 250 x 250 window, lattice 3 x 50 x 50) | `local::AdaptiveThresholdOp`, `Statistic::Isodata` |
-| equalize arm | `v * min(1 / max(p40, 1), 1.5 / p97.5)` over a 5 x 200 x 200 window of in-range voxels (lattice 5 x 50 x 50); `> 1.1` | `LocalStatisticOp` (masked), `normalise::bounded_gain_value` |
+| adaptive arm | the deconvolved volume against a local isodata threshold (3 x 250 x 250 window, lattice 3 x 50 x 50) | `local::AdaptiveThresholdOp` or `lattice_samples`, `Statistic::Isodata` |
+| equalize arm | `v * min(1 / max(p40, 1), 1.5 / p97.5)` over a 5 x 200 x 200 window of in-range voxels (lattice 5 x 50 x 50); `> 1.1` | `LocalStatisticOp` (masked) or `lattice_samples`, `normalise::bounded_gain_value` |
 | vesselize arm | the equalized volume clamped at 1.1 and rescaled to the bins; minus its median over a 30 x 30 disk of in-range voxels; Hessian tubeness at σ 1; `> 120` | `MaskedRankFilterOp`, `ridge::RidgeFilterOp` with `RatioResponse`, planned with `partition` |
 | smooth | six passes of a topology-preserving 3 x 3 x 3 configuration rule (spurs removed, pinholes filled), derived here from its definition | `configuration::ConfigurationPassOp` |
 | fill | background not reaching the outside of the volume becomes foreground | `fill::append_connected` (two fragment phases, merge in a barrier) |
@@ -95,6 +95,19 @@ the median (so under everything), deconvolution replaces the volume the
 adaptive arm thresholds, and equalisation replaces the volume the vessel arm
 filters. Turning one off reroutes the arms after it to the median. Every arm
 and both corrections can be turned off.
+
+The three window statistics on a lattice (lightsheet background, equalize
+percentiles, adaptive threshold) are evaluated one of two ways, with the same
+bytes out. Fused, each block evaluates every lattice point its halo brackets,
+so where halos overlap a point is evaluated several times — about three
+times for the equalize window on an 8-plane z slab. Evaluated once
+(`ops::lattice_samples`), a fragment phase computes each point in the block
+whose core holds it, at the window's own reach; a fragment-only phase hands
+each block the points its voxels bracket; and a third phase interpolates them
+and combines them with the voxels they are compared against. The choice is per statistic, against the plan's grid: once
+when the fused form would evaluate each point 1.5 times or more
+(`LocalStatistic::evaluations_per_sample`). `VESSEL_GRAPH_WINDOWS=fused` or
+`=once` forces one form, for measuring.
 
 ### Deep vessel filling (`src/segment/deep_fill`)
 
@@ -180,8 +193,30 @@ feature the deep filling is off by default and asking for it
 `--deep-fill-threshold` sets the threshold for every channel. The per-channel
 mask labels (`<name>-<role>-mask`) are the deep-filled masks. Library:
 `segment::deep_fill::{DeepFillParams, DeepFillSetup, DeepFillOutput,
-append_deep_fill, deep_fill}` (the last over an in-memory mask, returning the
-filled mask or the probability).
+DeepFillDevice, append_deep_fill, deep_fill}` (the last over an in-memory
+mask, returning the filled mask or the probability).
+
+**On a GPU.** `--features deep-fill-cuda` (or `deep-fill-wgpu`, through
+Vulkan, Metal or DX12) adds the same network on burn's GPU backend
+(`deep_fill/gpu.rs`), and `--deep-fill-device cpu|gpu|auto` (alias
+`--device`; default `auto`) chooses where it runs: `auto` is the GPU when the
+build has a runtime and a device is reachable, else the CPU; `gpu` refuses a
+run that has neither. Neither feature needs a CUDA toolkit to build (the
+driver and NVRTC are loaded at run time). The whole forward pass runs on the
+device, `conv3` as eight convolutions (one per output parity) and `conv4`
+composed with the upsampling before it into convolutions at half resolution
+(the outermost plane of each face recomputed the direct way, where conv4's
+zero padding differs); `gpu.rs` says what each saved. Blocks queue for one
+thread that drives the device, one block on it at a time. The device memory
+is its own cap, `blockflow::gpu`'s budget (three quarters of the device;
+`BLOCKFLOW_GPU_MEMORY` sets it, `BLOCKFLOW_GPU=off` hides the device): a
+forward pass holds at most 144 bytes per network-input voxel (measured: 4.7
+GB for 320 x 512 x 256, 8.3 GB for 512 x 512 x 256), leases that from the
+budget while it runs, and the deep-fill block is halved along its longest axis
+until its read extent fits. Host memory stays the planner's. The first pass
+of a process compiles the device's kernels (a few seconds; the GPU thread
+warms small shapes while the earlier phases run); a `cubecl.toml` in the
+working directory with `[compilation] cache = true` keeps them across runs.
 
 ### Tract maps (`src/segment/tract.rs`)
 
@@ -251,25 +286,41 @@ plan over the published labels and channels, attached as stored arrays.
    labels' chunk): the `uint64` vessel mask, skeleton and artery/vein masks
    narrowed to one `u8` image, a bit each, reading each label chunk once;
 2. *vertex measure* (`VertexMeasureOp`, a fragment phase on blocks of
-   `--block`, default `128,256,256`): the packed masks and the channels read
+   `--block`, default `128,256,256`; see the block grid below): the packed
+   masks and the channels read
    over the block's core grown by one reach — the radius walk's search limit
    (50) or the widest ball a signal can be read over (the search radius of the
    longest stop: 53 at the reference's 3-voxel artery shift), whichever is
    larger. For every skeleton voxel of the core: the walk
    (`RadiusSearch::stop_at`, the same `ops::walk::walk_from`), each signal's
-   maximum over the vertex's ball (`signal::Ball`), and the core's adjacent
-   pairs (`ops::adjacency::encode_adjacent_pairs`). Neither the walk nor a
-   ball can leave the window inside the volume, so each vertex gets the
-   whole-volume answer on every grid (`tests/graph_planned.rs`: one block,
-   dividing and non-dividing grids, blocks smaller than the reach, two search
-   limits). The rows are merged in coordinate order (the vertex list); the
-   pairs by `ops::adjacency::collect_pairs`.
+   maximum over the vertex's ball (`signal::Ball`), and a bit for each of its
+   lexicographically later neighbours (`ops::adjacency::forward_offsets`)
+   that is skeleton too: the adjacent pairs, in the order
+   `ops::adjacency::collect_pairs` lists them (`RawGraph::from_steps`). Neither
+   the walk nor a ball can leave the window inside the volume, so each vertex
+   gets the whole-volume answer on every grid (`tests/graph_planned.rs`: one
+   block, dividing and non-dividing grids, blocks smaller than the reach, two
+   search limits, the default grid). The rows are merged in coordinate order
+   (the vertex list); a second stream counts them per block, so the graph's
+   size is known (and its memory leased) before any row is read.
 
-`--workers`, `--cache-mb` (default 256) and `--work` (scratch, removed) do
-not change any result. The ball's maximum over a `bool`, `u8` or `u16` window
-has a fast path (no per-offset check where the ball's box is inside the
-volume and the window), and the ball's offset list holds only offsets within
-its radius, sorted once; the answers are the same.
+`--workers`, `--cache-mb` (default 256), `--block`, `--pack-block` and
+`--work` (scratch, removed) do not change any result. The ball's maximum over
+a `bool`, `u8` or `u16` window has a fast path (no per-offset check where the
+ball's box is inside the volume and the window), and the ball's offset list
+holds only offsets within its radius, sorted once; the radius walk reads its
+window through a typed slice (`ops::walk::walk_from` matches the image's type
+once, not at every offset as `ops::rows::value_at` does), about a quarter
+less CPU in the vertex measure; the answers are the same.
+
+The graph's two plans keep their measured blocks (above) unless one block of
+them does not fit the memory budget, and then run on the planner's grid
+(`strategy::choose_grid`). The planner's own choice is not the default: its
+cost model does not know that the vertex measure works through one block on
+every worker (a plane each), so it plans a block per worker and holds that
+many halo windows (2.9 GB at 24 s on the region, against 1.8 GB at 21 s on
+the default grid), and it counts the pack, which is bound by decoding the
+labels, as one read channel.
 
 **The block grid.** Without `--block`, `segment` and `tract` build their plan
 on each candidate grid of `blockflow::strategy::grid_candidates` (every axis
@@ -314,77 +365,140 @@ per atlas voxel and rendered once, one ball of weight `c` per voxel holding
 `f64`).
 
 **The rest.** The JSON is streamed (`VesselGraph::write_json`, the same text
-as `to_json`), and the tables' rows are reserved at their width. The atlas
-volumes (`--registration`, `--annotation-label`) and the branch density are
-on the atlas or density lattice, not the image's: a 25 µm atlas is fixed, and
-the density's default lattice is the coarsest pyramid level. They stay
-resident.
+as `to_json`, each value read as it is written), and so are the tables: each
+row is made from the graph's columns and pushed to
+`blockflow::object_table::ObjectTableBuilder`, which holds a word a value and
+sorts and spills runs past its buffer (what the memory budget has free, up to
+the whole table), the same files whatever the buffer. The atlas volumes
+(`--registration`, `--annotation-label`) and the branch density are on the
+atlas or density lattice, not the image's: a 25 µm atlas is fixed, and the
+density's default lattice is the coarsest pyramid level. They stay resident;
+the density's `f64` volume is let go once narrowed, before it is written.
 
-**The graph's own memory.** On the region (555 602 skeleton voxels, the raw
-vertices, and 692 550 raw edges; 58 788 vertices, 87 683 edges and 537 860
-polyline points after clean, reduce and the largest component, with the atlas
-columns): about 430 bytes per raw vertex at the high-water mark of stages 1–9
-(the raw graph and its carried columns, the cleaned and reduced structures and
-the assembled graph together), and the table writer adds about 450 bytes per
-polyline point while it writes the points table. At the crop's density with
-the deep filling (1.9 M raw vertices and 1.7 M polyline points per mm³) a
-450 mm³ brain has about 0.9 G raw vertices: some 370 GB for the graph stages
-and 340 GB more for the tables. That density is an upper bound (the
-skeleton's length density, 3.8 m/mm³, is several times the capillary length
-density usually reported). The reference holds its raw graph in graph-tool (a
-C++ adjacency list) with numpy property arrays: int16/int32 coordinates,
-float32 physical coordinates, a float64 radius per vertex and a float64
-length per edge (`graph_processing.graph_from_skeleton`), roughly 60–90 bytes
-per raw vertex by its source (not measured here). Ours is several times that:
-four radius arrays carried per vertex, the transient structures of clean and
-reduce, and the object table writer's per-row values.
+**The graph's own memory.** The graph is held as flat arrays, nothing per row
+(`graph::vessel`, `graph::store`): the raw graph is its coordinates (`u32` x
+3) and edges (`u32` pairs), built from a neighbour bit per vertex row rather
+than a list of pairs; the cleaned graph is a raw id per surviving vertex and
+its edges, the coordinates read off the raw graph's; reduce walks an
+incidence of edge ids. The columns measured on the raw graph are not copied
+to the vertex and polyline levels, which hold a cleaned-vertex id per row and
+read the raw graph's arrays through it (a clique centre's folded values
+apart): the four radius arrays are one `u32` per raw vertex, the walk's stop;
+an artery-channel maximum of a `uint16` channel an `f32`; a mask a byte.
+Columns set later are kept in the narrowest store that gives back every
+value's bits (`f32`, `i32`, flags), and the `_atlas` radius twins and the
+lattice changes are read through the columns they scale. Measured with a
+counting allocator (`tests/graph_memory.rs`), bytes per raw vertex at each
+stage's peak, on the region with the deep filling and the registration
+(487 172 raw vertices, 537 860 polyline points; heap above the 908 MB the
+atlas holds, constants such as the 21 MB radius search included) and on the
+crop (250 631 raw vertices, no atlas; 84 of each "after" figure there is the
+radius search's 21 MB):
+
+| stage | region before | region after | crop before | crop after |
+|---|---|---|---|---|
+| collect the vertex rows | 721 | 477 (43 of it the rows, the rest the chunk cache) | 757 | 425 (idem) |
+| raw graph | 413 | 73 | 552 | 113 |
+| clean | 274 | 97 | 272 | 136 |
+| reduce | 188 | 105 | 187 | 144 |
+| assemble | 274 | 99 | 276 | 138 |
+| largest component, lengths | 408 | 100 | 395 | 136 |
+| atlas: map and annotate | 259 | 143 | — | — |
+| tables and JSON | 862 | 382 (every row buffered) | 539 | 280 (idem) |
+
+On a synthetic lattice of 37 296 raw vertices the stages from clean to the
+lengths hold 62 bytes a raw vertex, the raw graph and its columns included,
+and the graph at the end 51; the atlas columns add about 37 on the region
+(`coordinates_atlas` as three `f64`s a point, the rest narrowed). The
+reference's graph-tool graph is roughly 60–90 bytes a raw vertex by its
+source. At the crop's density with the deep filling (1.9 M raw vertices a
+mm³, an upper bound) a 450 mm³ brain has about 0.86 G raw vertices: about
+53 GB for the graph stages (62 bytes a raw vertex), 69 GB in atlas space
+(80), against 370 GB before, and the tables in the writer's buffer (runs on
+disk past it), against 340 GB more before.
 
 **Memory cap** (`--memory-mb`, any subcommand; else `$BLOCKFLOW_MEMORY_CAP`,
 else the cgroup's `memory.max`, else `min(MemTotal / 2, MemAvailable * 3 /
 4)`; the first stderr line says which). An eighth of a stated or cgroup cap
 (at least 128 MiB) is held back; the rest is shared by the blocks in flight
-and the chunk caches (`blockflow::budget::process_budget`). The grid choice
-sizes each phase's blocks in flight under it (the `segment:`/`tract:` line
-reports the widest active set; `VESSEL_GRAPH_PROFILE=1` lists them per
-phase), the executor admits each wave against it and measures the resident
-set near the cap, and the caches hold what the blocks leave. Below the least
-feasible cap the run stops before reading anything and names that cap (about
-330 MiB for `tract` on the smoke crop: the label phases are on their own
-fixed grid). The resident thinning's ceiling (`--thin-memory-mb`) defaults to
-8 GiB or a quarter of the cap's usable bytes, whichever is less. The graph's
-own in-memory stages (raw graph, clean, reduce, tables) are not bounded by it.
-Results do not depend on the cap.
+and the chunk caches (`blockflow::budget::process_budget`), and a block that
+does not fit beside the caches makes them give bytes back.
 
-Measured 2026-10-22 at `--workers 16` (load 6–22): peak RSS (`/usr/bin/time`),
-wall s, CPU s. Every label, the tract CSV and the graph JSON are byte for
-byte those of the uncapped run.
+- **What a block costs.** Its phase's buffers (input, output, source images,
+  the buffers its chain holds between them), plus what its op says it
+  allocates beyond them (`FragmentOp::scratch_bytes`: the lattice-sample
+  phases declare their planes, brackets and sample boxes). The grid choice
+  sizes each phase's blocks in flight under the cap on that figure (the
+  `segment:`/`tract:` line reports the widest active set;
+  `VESSEL_GRAPH_PROFILE=1` lists them per phase). An op that can only use
+  one block at a time says so (`BlockOp::max_in_flight`; the deep filling on
+  a GPU, whose blocks queue for one device thread), and its phase is planned
+  and admitted at one block.
+- **Streaming admission.** The executor admits a block as soon as one in
+  flight finishes and the next one's charge fits; there are no waves. A block
+  is charged the plan's figure with the op margin (2.1x). A phase whose full
+  set of blocks at that charge would take more than half the budget is
+  measured: its first blocks start from a moment with nothing in flight, alone
+  and at twice the charge, and its later blocks are charged the most one of
+  them was seen to hold plus a quarter (never less than the plan's figure
+  without the margin), a figure that only rises. Nothing is learned while two phases are in flight
+  together.
+- **The resident check.** While near the cap the executor samples the
+  resident set. What no lease accounts for (the binary, the heap the
+  allocator kept) is leased at each moment with nothing in flight, and when
+  the resident set is more than a sixteenth of the budget over everything
+  leased, no block is admitted until it comes back.
+
+Below the least feasible cap the run stops before reading anything and names
+that cap (about 330 MiB for `tract` on the smoke crop: the label phases are
+on their own fixed grid). The resident thinning's ceiling
+(`--thin-memory-mb`) defaults to 8 GiB or a quarter of the cap's usable
+bytes, whichever is less. `graph` counts the raw vertices (a count per block
+beside the rows) and leases the graph's bytes before it reads a row
+(`planned::GRAPH_BYTES_PER_VERTEX`, 72, plus `ATLAS_BYTES_PER_VERTEX`, 48, in
+atlas space), held as long as the graph; the branch density leases 16 bytes
+a voxel of its lattice while it is made, and each table's row buffer is what
+the budget has free. Under a stated or cgroup cap a lease that does not fit
+stops the run naming the cap that would hold it; under the machine's own
+share it is a warning. Results do not depend on the cap.
+
+`graph`, measured 2026-10-22 (load 27–37), every output byte for byte the
+uncapped run's: on the crop without a branch density, uncapped 486–519 MB,
+512 MiB 279 MB, 256 MiB 215 MB, 160 MiB 135 MB (the vertex measure on the
+planner's grid, the tables spilled) at 5–10 s; with the branch density
+(404 MiB of its own on the crop's single level) 1024 MiB 386 MB against
+559 MB before, and 512 MiB refused naming about 550 MiB. On the region in
+atlas space the registration's own loading peaked at 1.74 GB (not leased
+then; the prepared atlas's volumes are leased since 2026-10-23);
+the graph stages stay under 1.51 GB at a 1536 MiB cap.
+
+`tract` and `segment`, measured 2026-10-23 at `--workers 16` (load 6–23),
+one run each: peak RSS (`/usr/bin/time`), wall s, CPU s. Every label, the
+tract CSV and the graph JSON are byte for byte those of the uncapped run;
+the cgroup rows run under `systemd-run --user --scope -p MemoryMax=`.
 
 | run | cap | peak | wall | CPU |
 |---|---|---|---|---|
-| `tract`, smoke crop | none | 2.2–2.5 GB | 10 | 76 |
-| | 2048 MiB | 1365 MiB | 18 | 77 |
-| | 1536 MiB | 1119 MiB | 16 | 76 |
-| | 1536 MiB (cgroup) | 1129 MiB | 17 | 79 |
-| | 1024 MiB | 796 MiB | 22 | 74 |
-| | 768 MiB | 513 MiB | 29 | 74 |
-| | 512 MiB | 344 MiB | 47 | 74 |
-| | 256 MiB | refused: needs about 330 MiB | | |
-| `tract`, region | none | 3.6 GB | 18 | 147 |
-| | 2048 MiB | 1500 MiB | 29 | 170 |
-| | 1024 MiB | 770 MiB | 35 | 165 |
-| `segment`, smoke crop | none | 3.4–3.7 GB | 28 | 245 |
-| | 2048 MiB | 1530 MiB | 40 | 242 |
-| | 2048 MiB (cgroup) | 1465 MiB | 40 | 237 |
-| | 1024 MiB | 844 MiB | 86 | 247 |
-| `segment`, region | none | 8.0 GB | 52 | 440 |
-| | 4096 MiB | 3008 MiB | 68 | 481 |
-| | 2048 MiB | 1941 MiB | 76 | 547 |
+| `tract`, smoke crop | none | 1897 MiB | 9.4 | 67 |
+| | 1024 MiB | 678 MiB | 16 | 72 |
+| | 1024 MiB (cgroup) | 652 MiB | 16 | 73 |
+| | 512 MiB | 307 MiB | 29 | 91 |
+| `segment`, smoke crop | none | 3045 MiB | 24 | 190 |
+| | 2048 MiB | 1188 MiB | 39 | 201 |
+| | 1024 MiB | 897 MiB | 45 | 198 |
+| | 1024 MiB (cgroup) | 804 MiB | 46 | 197 |
+| `segment`, region | 2048 MiB | 1807 MiB | 66 | 420 |
 
-The CPU time does not move; the wall time does, because the executor runs a
-wave of blocks at a time and a phase that fits fewer blocks runs more waves,
-and the first wave of each phase is charged with the op margin (2–5x what the
-vessel phases were measured to hold) before later waves are charged what was
-measured.
+Before the lattice-sample phases declared their scratch, the interpolating
+phase held about 46 bytes a voxel against the 6 it was charged, and `tract`
+at 512 MiB peaked at 975 MiB. The CPU time moves little with the cap; the
+wall time rises because a phase that fits fewer blocks runs fewer at once.
+Streaming admission against the waves it replaced (2026-10-22, load 7–19,
+before → after): `segment` on the region uncapped 55.6 → 50.5 s, 486 →
+465 s CPU, 8.1 → 7.5 GB; at 2048 MiB 72 → 62 s, 2.0 → 1.76 GB. At the
+tightest caps (`tract` at 512 MiB, `segment` on the crop at 1024 MiB) the
+wall time did not move (48 → 49 s, 59 → 57 s): the dominant phases fit one
+or two blocks there, so there was no waiting on a wave to recover.
 
 `VESSEL_GRAPH_PROFILE=1` prints, per stage and per planned phase, the wall
 and CPU time and the resident set and its peak (it resets the peak through
@@ -737,7 +851,155 @@ other jobs; the reference with torch 2.6, without `no_grad` as it runs):
 | reference GPU (Quadro RTX 5000, float16) | 0.88 s, 2.9 GB on the GPU | 2.1 s, 0.44 GB |
 
 The whole `segment` on the crop: 104.9 s and 5.6 GB with the deep filling,
-91–93 s and 5.3 GB without. Ours has no GPU path.
+91–93 s and 5.3 GB without.
+
+**On the GPU** (Quadro RTX 5000, 16 GB, CUDA 12.8 driver; `deep-fill-cuda`,
+float32; load averages 24–31; `tests/deep_fill_reference.rs`
+`crop_gpu_against_cpu` and `reference-clearmap/fill_vessels.py --device cuda`):
+
+| | vessel | artery |
+|---|---|---|
+| ours, CPU (40 threads) | 9.3–12.1 s | 1.35–1.73 s |
+| ours, GPU, warm | 0.92–1.0 s | 0.52–0.55 s |
+| ours, GPU, first pass of the process (device opened, kernels compiled) | 3.8 s | |
+| reference GPU, float16, as shipped (dropout) | 1.1–1.5 s, 2.7 GB on the GPU | 0.67–0.68 s, 0.41 GB |
+| reference GPU, float16, evaluation mode | 0.97–0.98 s, 2.6 GB | 0.75–0.84 s, 0.40 GB |
+
+Ours on the GPU against ours on the CPU, over the crop: probability max
+difference 7.8e-7 (vessel) and 4.2e-7 (artery), mean 2.8e-8 and 1.1e-8;
+the filled masks are identical. Against the reference the GPU's numbers are
+the CPU's above (Dice 0.9660 vessel, 0.9737 artery with its `fill_vessels` in
+evaluation mode). The whole `segment` with deep filling, alternating runs
+(wall s / CPU s / peak GB; load averages 30–60, shared with other jobs; outputs
+under `/husky/henriksson/lightsheet-reference/round3/F`):
+
+| | crop | region |
+|---|---|---|
+| CPU | 51 / 397 / 3.04; 52 / 395 / 3.01; 60 / 395 / 2.95 | 143 / 823 / 6.28; 105 / 734 / 6.16; 102 / 790 / 6.06 |
+| GPU | 33 / 353 / 3.64; 43 / 350 / 3.63; 39 / 358 / 3.32 | 61 / 645 / 6.65; 80 / 633 / 6.39; 59 / 608 / 6.43 |
+| deep-fill phases, CPU (vessel; artery wall s) | 12.3–18.3; 2.2–2.5 | 16.2–38.3; 3.0–5.2 |
+| deep-fill phases, GPU | 2.3–2.6; 0.50–0.72 | 2.2–2.9; 0.68–1.66 |
+
+Every label of the crop is identical between the two; on the region two
+voxels of the vessel channel's mask differ (of 67 M; rounding at the
+threshold), one of the united mask, and the skeleton is identical. The
+GPU's peak host memory is 0.3–0.6 GB above the CPU's: the CUDA context and
+runtime compiler.
+
+### Graph against the reference
+
+`reference-clearmap/compare_graph.sh WORK` compares our graph with the
+reference's TubeMap graph (`benchmark/clearmap/vessels.py`, `vasculature.yml`
+v3.1, no deep filling) on the same two-channel image, and runs each side's
+graph half on the other side's skeleton and mask so the differences can be
+placed: `clearmap_graph.py` is the reference's graph half on any skeleton
+(`graph_from_skeleton`, radii, artery signals, `clean_graph`,
+`reduce_graph`, its classifier) and exports its graphs as arrays;
+`compare_graph.py` matches skeleton voxels, branch and end points (one to
+one, nearest first), edges (by their matched ends, then polyline distance),
+radii, lengths, tortuosity and artery labels, and in atlas space carries
+both graphs through the same registration. Outputs for the two volumes below
+are in `/husky/henriksson/lightsheet-reference/round3/B/{smoke,region}/compare`.
+
+Volumes: the benchmark's smoke crop (tile 05x05 of osf-sa3x8, 128 x 512 x
+404) and the fused region (512 x 512 x 256, z 160:672, y 896:1408, x 320:576
+of the fused osf-sa3x8, 1.6 x 1.625 x 1.625 µm), with the pipeline's
+registration (fused -> autofluorescence -> ABA 2017 25 µm, `(1,-2,3)`) for
+the atlas part. "a / b" is ours / the reference.
+
+| region volume | 1 full | 2 graph half, our skeleton | 3 graph half, its skeleton | 4 thinning, our mask | 5 mask only |
+|---|---|---|---|---|---|
+| a vs b | ours vs reference | ours vs its graph half | ours vs its graph half | ours vs its thinning | its chain on our mask vs on its mask |
+| vertices | 61 904 / 59 953 | identical | identical | 61 904 / 60 639 | 60 639 / 59 953 |
+| edges | 89 491 / 86 987 | identical | identical | 89 491 / 88 278 | 88 278 / 86 987 |
+| total length | 1293 / 1271 mm | identical | identical | 1293 / 1287 mm | 1287 / 1271 mm |
+| skeleton voxels, exact F1 (within 3 µm) | 0.517 (0.863) | | | 0.574 (0.893) | 0.772 (0.923) |
+| branch points within 5 µm, F1 (10 µm) | 0.793 (0.842) | 1 | 1 | 0.831 (0.870) | 0.875 (0.899) |
+| matched branch points of equal degree | 0.680 | 1 | 1 | 0.730 | 0.814 |
+| edges matched by ends, F1 | 0.523 | 1 | 1 | 0.592 | 0.707 |
+| polyline length within 3 µm of the other's | 0.920 / 0.928 | 1 / 1 | 1 / 1 | 0.946 / 0.946 | 0.947 / 0.955 |
+| `artery_binary` / `artery` kappa, matched edges | 0.927 / 0.882 | 0.9992 / 0.9988 | 0.9995 / 0.9996 | 0.933 / 0.896 | 0.963 / 0.938 |
+
+The smoke crop gives the same picture (full: 31 667 / 30 253 vertices,
+567 / 549 mm, skeleton exact F1 0.522, branch F1 0.776, edges F1 0.530; on
+one skeleton both graph halves agree exactly). What each step contributes:
+
+- **Graph half: none.** On the same skeleton and mask, both directions give
+  the same vertices, edges, polylines, lengths (`length` is the sum of
+  26-neighbour steps in µm on both sides, a clique centre being the
+  per-axis median of its members, the reference's
+  `medoid_vertex_coordinates`), voxel radii and distances to the surface,
+  and differ only in the radius walk's **tie order**: both walk the ellipsoid
+  of offsets by voxel length and stop at the first background voxel
+  (`radius_measurements.search_indices_sphere`, ours
+  `RadiusSearch::new`), but within a set of equally long offsets the
+  reference takes whichever numpy's unstable `argsort` puts first and ours
+  the lexicographic first. The voxel radius is the same; the µm radius
+  differs by up to 0.03 µm on 17 % of edges (z is 1.6 µm, y and x 1.625),
+  and the per-axis offset, from which both sides take the artery search
+  radius (`floor(max(radius_units_axial + shift) / spacing)`,
+  `tube_map._set_vertex_vessel_type_expression`, ours
+  `signal::search_radii`), on 2.4 % of vertices, which moves `artery_raw`
+  on 20 % of them and `artery_binary` on 10 of 61 904. After
+  classification: 11 of 86 987 edges, in atlas space too (pair 7, with the
+  distance to the surface identical on every edge). Defensible either way;
+  the reference's choice depends on numpy's sort.
+- **Thinning: the largest single difference, and only an axis convention.**
+  Both are the Palágyi–Kuba 12-subiteration thinning with the border set
+  taken once per pass (the reference's `PK12.skeletonize_index`, ours
+  `ops::directional`), but the reference applies its rotations and lookup
+  table to `(x, y, z)` arrays and ours to `[z, y, x]`. The reference's
+  thinning of our mask with the axes handed over reversed **is our skeleton
+  voxel for voxel** (both volumes; `compare/skeleton-in-our-frame.json`). In
+  its own frame it keeps a different, equally valid medial voxel about half
+  the time: exact F1 0.57, 0.89 within 3 µm, and 1–1.5 % more branch
+  points on ours. Neither frame is more correct, but thinning in the reference's
+  frame (the orientation table permuted, or the volume transposed) would make
+  this step exact; `directional_pass_with_sources_into` already takes the
+  table.
+- **Mask: the rest.** Our final mask is a 1.9 % larger near-superset of the
+  reference's (Dice 0.982; on the smoke crop 146 k voxels only ours, 47 k
+  only theirs, mostly the vessel channel after smoothing and filling: 135 k
+  / 46 k there, against +0.2 % for the binarisation alone on the tile region above). Through
+  the reference's own thinning and graph half that becomes +1.2 % length,
+  +1.4 % branch points and +0.6 % end points (pair 5), and it is what
+  remains once the thinning frame matches.
+
+Graph-level statistics (region; smoke in brackets): length density 4562 /
+4482 mm/mm³ (5071 / 4906), branch density 155 700 / 152 100 per mm³
+(158 100 / 151 500), components 1368 / 1336 (2857 / 2829), the largest
+holding 99.0 % / 99.0 % of the length, degree histograms of the same shape
+(degree 3: 28 640 / 28 169, 4: 8 863 / 8 553, 5: 3 506 / 3 352), self-loops
+903 / 897, median edge length 12.8 µm on both, median tortuosity 1.125 on
+both. On matched edges (full pair) the median polyline distance is 1.05 µm,
+the length difference median 0, and the edge radius (`radius_units`, the
+maximum along the edge on both sides) median difference 0 (Pearson 0.94).
+No edge is a vein on either side in this cortex box: no edge reaches the
+12.5 µm vein radius with an artery intensity at or below 2500.
+
+In atlas space (both graphs through the same registration; every 8th voxel
+of the box mapped for the region volumes; ours labels identically to its own
+`annotation` column), length and branch density per region:
+
+| region | volume in box | length density, mm/mm³ | branch points per mm³ |
+|---|---|---|---|
+| SSs2/3 | 0.095 mm³ | 6525 / 6425 (+1.6 %) | 219 900 / 215 500 (+2.0 %) |
+| SSs1 | 0.051 mm³ | 7314 / 7192 (+1.7 %) | 247 900 / 243 900 (+1.7 %) |
+| SSs4 | 0.034 mm³ | 7596 / 7420 (+2.4 %) | 270 500 / 260 000 (+4.0 %) |
+| SSp-n2/3 | 0.003 mm³ | 6601 / 6421 (+2.8 %) | 224 600 / 217 900 (+3.1 %) |
+| SSs (all layers) | 0.182 mm³ | 6939 / 6818 (+1.8 %) | 236 900 / 231 400 (+2.4 %) |
+
+and by depth (distance to the surface, 2-voxel = 50 µm bins inside the
+brain) ours is 0.8–3.9 % above the reference in length density in every bin
+with the same profile (3596 / 3556 at the surface, a peak of 9168 / 9013 at
+50–100 µm, 5890 / 5774 at 200–250 µm, 7848 / 7669 at 400–450 µm). The
+reference's classifier needs the atlas's distance to the surface (it indexes
+it unconditionally); without an atlas, `clearmap_graph.py classify` passes
+that test everywhere, as `graph` does.
+
+`benchmark/checks.py vessels` reports a summary of the same comparison per
+benchmark repeat (`graph`: skeleton, branch, end point and edge F1, length
+coverage, densities; about 30–50 s on the smoke crop).
 
 ### Out of core: before and after
 
@@ -796,7 +1058,7 @@ What moved:
   (`segment_thin_stored`, ignored test): resident 7–20 s of wall and 86–175 s
   of CPU, stored 14–39 s and 74–105 s, depending on the grid and the load.
 
-### Speed: sliding percentiles, the thinning's border list and dirty set, the chosen grid
+### Speed
 
 Measured 2026-10-20 at `--workers 16` on the 40-core shared machine (one-minute
 load 10–60 during the runs), `segment` with profiling off, before and after
@@ -816,22 +1078,40 @@ channels) and two on the osf-sa3x8 region (`512 x 512 x 256`). Wall s / CPU s
 558 / 3.78 before, 20 / 163 / 3.66 after. Every label (voxels and stored
 bytes), the graph JSON and the tract CSV are byte for byte the same.
 
-What moved:
+What moved, then and since:
 
-- the lightsheet line (150 voxels along `x`) and the vessel-background disk
-  (709 offsets) are `ops::sliding::SlidingHistogramOp` on the clip's bins
-  rather than a dense gather (crop phases 3 and 11: 173 and 439 s of CPU before,
-  29 and 30 s after);
-- the thinning: a pass visits its border list instead of scanning every
-  voxel thirteen times, the block copies are flat, and the iterative phase
-  reruns only blocks a change can reach (crop: 84 s of CPU before, 21 s after);
-  the stored rounds, `--thin-memory-mb 0`, 64 s to 30 s of CPU;
-- the grid: chosen by the planner (above). On the crop `[8, 512, 404]`: the
+- **The sliding histogram.** The lightsheet line (150 voxels along `x`) and
+  the vessel-background disk (709 offsets) are
+  `ops::sliding::SlidingHistogramOp` on the clip's bins rather than a dense
+  gather (crop phases 3 and 11: 173 and 439 s of CPU before, 29 and 30 s
+  after).
+- **The thinning's border list.** A pass visits its border voxels, held as a
+  list, instead of scanning every voxel thirteen times; the block copies are
+  flat; and the iterative phase reruns only the blocks a change can reach
+  (crop: 84 s of CPU before, 21 s after; the stored rounds,
+  `--thin-memory-mb 0`, 64 s to 30 s).
+- **Planner-chosen grids** (above). On the crop `[8, 512, 404]`: the
   plane-wide windows read no halo in `y, x`, and sixteen blocks keep sixteen
   workers busy where `[64, 256, 256]` gave eight; on the region `[32, 512,
-  256]`;
-- a heap release at every phase boundary (`profile::Listening`), without which
-  the region's peak was 9.1 GB on the chosen grid.
+  256]`.
+- **A heap release at every phase boundary** (`profile::Listening`), without
+  which the region's peak was 9.1 GB on the chosen grid.
+- **Lattice samples** (2026-10-22). The three window statistics on a lattice
+  are evaluated once per lattice point (`ops::lattice_samples`, see
+  "Segmentation") where the fused form would evaluate a point 1.5 times or
+  more. Medians of four runs, fused → once (load 35–52): smoke crop 34.0 →
+  32.4 s, 311 → 248 s CPU, 2.89 → 2.49 GB; region 78.2 → 76.2 s, 551 →
+  525 s CPU, 5.91 → 5.70 GB; with the deep filling, crop 365 → 311 s CPU
+  and region 794 → 760 s. The labels are identical.
+- **Streaming admission** (2026-10-22; "Memory cap" above). Uncapped, on the
+  region: 55.6 → 50.5 s, 486 → 465 s CPU, 8.1 → 7.5 GB; `tract` on the crop
+  10.0 → 9.8 s, 76 → 69 s CPU, 2.57 → 2.06 GB.
+- **GPU deep fill** (2026-10-22; "Deep vessel filling"). The whole `segment`
+  with deep filling, CPU → GPU: crop 51–60 → 33–43 s, region 102–143 →
+  59–80 s; the deep-fill phases themselves 12.3–18.3 → 2.3–2.6 s (crop,
+  vessel). One block is on the device at a time (`BlockOp::max_in_flight`),
+  so the phase does not park workers and their buffers in the device's
+  queue.
 
 ## Limitations
 

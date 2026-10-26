@@ -64,6 +64,33 @@ vectors after return must be budgeted by the caller while retained.
 Files are `manifest.json`, streaming `cells.bin` (24 bytes per occupied key),
 and `pages/z/y/x.rows`. Each page uses the existing Table schema/encoding,
 with native anchor plus five F64 values (physical XYZ, weight, scale).
+Version 2 is opt-in through `Writer::create_with_layout(..., PageLayout::Packed)`.
+The original `create` keeps version 1. Version 2 keeps the exact `cells.bin`
+keys and Table page encodings, concatenates pages into `pages.bin`, and stores
+one little-endian `(offset:u64, length:u64)` pair per occupied key in
+`page_offsets.bin`. It adds no resident whole-index table. Bindings, retention,
+row ordering and FeatureKeys have the same meaning in both layouts. New readers
+open both versions; older readers reject version 2 rather than guessing.
+
+Packed payload/offset/key files are synchronized before publishing the sealed
+manifest. The root and its existing parent directory are synchronized before
+publication, and the root again after the manifest rename. Ancestors above that
+parent are caller-owned and are not synchronized here. This requires filesystem
+support for directory synchronization; errors are propagated without silently
+weakening it. It is still not a transactional recovery protocol or a power-loss
+test. A failure before final rename leaves the manifest unsealed. A failure in
+the final directory synchronization may leave a complete sealed index visible
+despite `finish` returning an error; callers must record success only on `Ok`.
+Budget-stopped or poisoned writes never reach publication.
+
+Packed readers check offset-table length on open, and validate checked ranges,
+page sizes, schema and cell membership before returning points. Missing or
+corrupt data are errors. Files have no checksums and assume immutable input.
+An uncached packed-page access adds one charged 16-byte directory read; cached
+decoded pages avoid it. Packed write batches charge page bytes plus the 24-byte
+key and 16-byte offset record. As in version 1, write-call counters represent
+logical page/directory batches, not individual OS writes or durability calls.
+
 `Reader::open` retains the uncached path. Opt-in
 `Reader::open_cached(root, binding, memory, ReadCacheConfig)` adds a byte-capped
 LRU over directory blocks and decoded feature pages. It uses opportunistic

@@ -3,7 +3,7 @@
 # Original work for this crate.
 """Output agreement for one benchmark repeat, so a fast but wrong run shows.
 
-    checks.py vessels RUN_DIR            (numpy, zarr)
+    checks.py vessels RUN_DIR            (numpy, scipy, zarr; the reference's Python reads its graph)
     checks.py registration RUN_DIR       (the reference's Python: transformix)
     checks.py e2e RUN_DIR                (the reference's Python: pandas, scipy, transformix)
 
@@ -20,6 +20,8 @@ from pathlib import Path
 import numpy as np
 
 CLEARMAP = os.environ.get("CLEARMAP_ROOT", "/data/henriksson/github/claude/clearmap-rs/ClearMap-py")
+CLEARMAP_PY = os.environ.get("CLEARMAP_PY", "/home/mahogny/miniconda3/envs/clearmap-gt2/bin/python")
+VESSEL_REFERENCE = Path(__file__).resolve().parents[2] / "vessel-graph" / "reference-clearmap"
 POINTS = Path(os.environ.get("REG_OUT", "/husky/henriksson/lightsheet-reference/registration")) / "points"
 
 
@@ -48,7 +50,7 @@ def vessels(run):
     length = graph["edge"].get("length_units")
     if isinstance(length, dict):          # {"width": 1, "values": [...]}
         length = length["values"]
-    return {
+    record = {
         "mask_voxels": {"clearmap": int(cm_final.sum()), "ours": int(mask.sum())},
         "mask_dice": round(dice(cm_final != 0, mask), 4),
         "skeleton_voxels": {"clearmap": int(cm_skeleton.sum()), "ours": int(skeleton.sum())},
@@ -56,6 +58,48 @@ def vessels(run):
         "graph_edges": {"clearmap": cm["graph_reduced"]["edges"], "ours": len(graph["edges"])},
         "total_length_um": {"clearmap": cm.get("total_edge_length_units", cm.get("total_edge_length")),
                             "ours": float(np.sum(length)) if length is not None else None},
+    }
+    try:
+        record["graph"] = vessel_graph_agreement(run, cm_dir, ours_dir, skeleton, cm_skeleton)
+    except Exception as error:  # noqa: BLE001 - the counts above stand on their own
+        record["graph"] = {"error": f"{type(error).__name__}: {error}"[-500:]}
+    return record
+
+
+def vessel_graph_agreement(run, cm_dir, ours_dir, skeleton, cm_skeleton):
+    """The graph-level comparison of `vessel-graph/reference-clearmap/
+    compare_graph.py`, in brief: skeleton voxels matched within 3 µm, branch
+    and end points within 5 µm, edges by their matched ends, and the polyline
+    length within 3 µm of the other graph (precision is ours, recall the
+    reference's share)."""
+    out = run / "check-graph"
+    out.mkdir(exist_ok=True)
+    npz = out / "clearmap_graph.npz"
+    subprocess.run([CLEARMAP_PY, "-I", str(VESSEL_REFERENCE / "clearmap_graph.py"), "export", "--graph",
+                    str(cm_dir / "graph_reduced.gt"), "--out", str(npz)], check=True, capture_output=True)
+    sys.path.insert(0, str(VESSEL_REFERENCE))
+    import compare_graph as cg
+    spacing, _, _ = cg.frame(ours_dir / "image.ome.zarr")
+    ours, theirs = cg.load_graph(f"ours={ours_dir / 'graph.json'}"), cg.load_graph(f"clearmap={npz}")
+    vertices = cg.compare_vertices(ours, theirs, spacing, 5.0)
+    edges, _ = cg.compare_edges(ours, theirs, spacing, 5.0)
+    skeletons = cg.compare_skeletons(skeleton, cm_skeleton, spacing)
+
+    def short(entry):
+        return {k: entry[k] for k in ("precision", "recall", "f1")}
+    stats = {side: cg.stats(g, spacing, skeleton.shape) for side, g in (("clearmap", theirs), ("ours", ours))}
+    return {
+        "skeleton_exact": short(skeletons["exact"]), "skeleton_within_3um": short(skeletons["within_3um"]),
+        "branch_points_within_5um": short(vertices["branch_points_within_5um"]),
+        "branch_degree_equal": vertices["branch_points_within_5um"]["degree_equal"],
+        "end_points_within_5um": short(vertices["end_points_within_5um"]),
+        "edges_by_endpoints": short(edges["matched_by_endpoints"]),
+        "matched_path_mean_distance_um_p50": edges.get("path_mean_distance_um", {}).get("p50"),
+        "matched_length_within_10pc": edges.get("length_um_matched", {}).get("relative_within_10pc"),
+        "artery_binary_kappa": edges.get("artery_binary_matched", {}).get("kappa"),
+        "length_coverage": cg.coverage(ours, theirs, spacing),
+        **{key: {side: stats[side][key] for side in stats}
+           for key in ("branch_points", "end_points", "components", "length_density_mm_per_mm3")},
     }
 
 

@@ -2,6 +2,8 @@
 # library repository. Consumers pin their own dependency graph.
 /target/
 /Cargo.lock
+# Examples outside the workspace build into their own target directory.
+/examples/*/target/
 
 # Local agent/editor state.
 /.claude/

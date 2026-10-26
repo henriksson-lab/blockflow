@@ -327,6 +327,7 @@ pub mod diffuse;
 pub mod directional;
 pub mod edges;
 pub mod element;
+pub mod envelope;
 pub mod exposure;
 pub mod features;
 /// **Not a `BlockOp`, and deliberately.** A Fourier coefficient is a sum over
@@ -335,7 +336,6 @@ pub mod features;
 /// took instead and why the three obvious ways of wrapping it in this crate's
 /// lattice do not exist.
 pub mod fft;
-pub mod envelope;
 pub mod fill;
 pub(crate) mod histogram;
 pub mod intensity_statistics;
@@ -345,6 +345,7 @@ pub mod interior_partition;
 pub mod label;
 pub mod label_energy;
 pub mod lattice;
+pub mod lattice_samples;
 pub mod level_set;
 pub mod local;
 pub mod measure;

@@ -1085,6 +1085,15 @@ impl FragmentOp for PartitionOp {
     }
 }
 
+/// A view of any element type `dispatch_f64_input!` hands over, as `f64`.
+///
+/// A function rather than `mapv(|v| v.into())` in the macro's body, because
+/// the body is expanded once per element type and for `f64` that conversion is
+/// the identity.
+fn widened<T: Copy + Into<f64>>(view: ArrayView3<'_, T>) -> Array3<f64> {
+    view.mapv(Into::into)
+}
+
 /// `extent` voxels from `start` (volume coordinates) of a buffer read from
 /// `read`, widened to `f64`.
 fn window_of(
@@ -1102,7 +1111,7 @@ fn window_of(
     dispatch_f64_input!(
         raw,
         Error::invalid("the partition op cannot read half-precision"),
-        |view| { Ok(view.slice(cut).mapv(|v| v.into())) }
+        |view| { Ok(widened(view.slice(cut))) }
     )
 }
 

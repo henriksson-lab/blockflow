@@ -10,11 +10,14 @@ use blockflow::Result;
 use clap::{Parser, ValueEnum};
 use serde_json::json;
 use tile_stitching::fuse::{Method, Weighting};
-use tile_stitching::io::{aligned_positions_json, read_tile, write_volume_at, TileSetFile};
+use tile_stitching::io::{aligned_positions_json, open_tile, read_tile, TileSetFile};
+use tile_stitching::planned::fuse_to_pyramid;
+use tile_stitching::pyramid::pyramid_factors;
 use tile_stitching::relayout::{anchor, fused_translation, StoredLayout};
 use tile_stitching::rigid::RigidParams;
 use tile_stitching::tile_dir::{from_directory, TileDirOptions};
-use tile_stitching::{align, fuse, StitchParams};
+use tile_stitching::tiles::StoredTiles;
+use tile_stitching::{align_stored, StitchParams};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum FuseMethod {
@@ -97,6 +100,12 @@ struct Cli {
     /// Pyramid levels to write, level 0 included.
     #[arg(long, default_value_t = 4)]
     out_levels: usize,
+    /// Memory cap in MiB: the most the run may hold resident (default:
+    /// $BLOCKFLOW_MEMORY_CAP, else the cgroup's limit, else a share of the
+    /// machine). The pairs aligned at once and the slabs fused at once are
+    /// fitted under it; the results do not depend on it.
+    #[arg(long)]
+    memory_mb: Option<u64>,
 }
 
 fn parse_signed_range(text: &str) -> std::result::Result<(isize, isize), String> {
@@ -171,7 +180,17 @@ fn main() {
         eprintln!("tile-stitching: use a release build (cargo run --release)");
         std::process::exit(2);
     }
-    if let Err(error) = run(&Cli::parse()) {
+    let cli = Cli::parse();
+    let cap = blockflow::budget::MemoryCap::resolve(cli.memory_mb.map(|mib| mib << 20));
+    if cap.is_binding() {
+        limit_heap_retention();
+    }
+    blockflow::budget::set_process_cap(cap);
+    eprintln!(
+        "memory cap: {cap}, {} MiB for tiles, pairs and slabs in flight",
+        cap.usable_bytes() >> 20
+    );
+    if let Err(error) = run(&cli) {
         eprintln!("tile-stitching: {error}");
         std::process::exit(1);
     }
@@ -237,25 +256,26 @@ fn run(cli: &Cli) -> Result<()> {
             ))
         }
     };
-    let mut tiles = Vec::with_capacity(tile_set.tiles.len());
-    let (mut voxel_size, mut unit, mut tile_translation) = ([1.0; 3], None, [0.0; 3]);
+    // Opened, not read: the alignment reads only the boxes each pair needs,
+    // and the fusion only the boxes each slab needs.
+    let mut infos = Vec::with_capacity(tile_set.tiles.len());
     for (index, entry) in tile_set.tiles.iter().enumerate() {
-        let image = read_tile(&entry.path, cli.channel, cli.level, cli.z_range)?;
-        let tile = image.voxels;
+        let info = open_tile(&entry.path, cli.channel, cli.level, cli.z_range)?;
         eprintln!(
             "tile {index}: {} {:?} {}",
             entry.path.display(),
-            tile.shape(),
-            tile.dtype().numpy_name()
+            info.shape,
+            info.dtype.numpy_name()
         );
-        if index == 0 {
-            voxel_size = image.voxel_size;
-            unit = image.unit;
-            tile_translation = image.translation;
-        }
-        tiles.push(tile);
+        infos.push(info);
     }
-    let shapes = tiles.iter().map(|tile| tile.shape()).collect::<Vec<_>>();
+    let (voxel_size, unit, tile_translation) = (
+        infos[0].voxel_size,
+        infos[0].unit.clone(),
+        infos[0].translation,
+    );
+    let tiles = StoredTiles::new(&infos)?;
+    let shapes = tiles.shapes.clone();
     let layout = tile_set.layout(&shapes)?;
     let grid_axes = tile_set.grid_axes()?;
 
@@ -275,7 +295,7 @@ fn run(cli: &Cli) -> Result<()> {
     params.fuse.method = fuse_method(cli.fuse);
     params.fuse.weighting = Weighting::Pyramid;
 
-    let stitched = align(&tiles, layout.clone(), &params)?;
+    let stitched = align_stored(&tiles, layout.clone(), &params)?;
     for (index, alignment) in stitched.layout.alignments().iter().enumerate() {
         eprintln!(
             "alignment {index}: tiles {} -> {} displacement {:?} quality {:.4e}",
@@ -287,14 +307,6 @@ fn run(cli: &Cli) -> Result<()> {
         "aligned, fused shape {fused_shape:?}, in {:.1?}",
         started.elapsed()
     );
-    let fused = if cli.positions_only {
-        None
-    } else {
-        let fused = fuse::resident(&params.fuse, &tiles, &stitched.placement)?;
-        eprintln!("fused in {:.1?}", started.elapsed());
-        Some(fused)
-    };
-    drop(tiles);
 
     // The fused frame is the first tile's (see `relayout`).
     let z_offset = cli.z_range.map_or(0, |range| range.0);
@@ -338,20 +350,32 @@ fn run(cli: &Cli) -> Result<()> {
     json["translation"] = json!(translation);
     // The positions first: they are small and the image write is the slow part.
     write_json(&positions_path, &json)?;
-    if let Some(fused) = &fused {
-        write_volume_at(
+    // The image slab by slab, as `--layout-from` fuses: byte for byte the
+    // resident fusion written whole.
+    let fused = !cli.positions_only;
+    if fused {
+        let region = Region::new(&[0, 0, 0], &fused_shape);
+        let stats = fuse_to_pyramid(
+            &params.fuse,
+            &stitched.placement,
+            &tiles.sources,
+            tiles.dtype,
+            &region,
             &cli.out,
-            fused,
-            voxel_size,
-            translation,
-            unit.as_deref(),
-            cli.out_levels,
+            &pyramid_factors(fused_shape, cli.out_levels),
+            PhysicalFrame::new(voxel_size, unit.as_deref()).with_origin(translation),
         )?;
+        eprintln!(
+            "fused in {} slabs, {:.2} G tile voxels read, in {:.1?}",
+            stats.slabs,
+            stats.voxels_read as f64 / 1e9,
+            started.elapsed()
+        );
     }
     println!(
         "wrote {}{} {fused_shape:?} in {:.1?}",
         positions_path.display(),
-        if fused.is_some() {
+        if fused {
             format!(" and {}", cli.out.display())
         } else {
             String::new()
@@ -432,6 +456,24 @@ fn run_relayout(cli: &Cli, path: &std::path::Path) -> Result<()> {
         started.elapsed()
     );
     Ok(())
+}
+
+/// A fixed 4 MiB mmap threshold under a binding cap. glibc raises the
+/// threshold as large buffers are freed, after which tile buffers, slabs and
+/// cut boxes come from the arenas and stay there once freed: retention (half a
+/// gigabyte for osf-cztq2 at level 2) that the planned fusion cannot see.
+/// Fixed, every buffer of 4 MiB or more is mapped and handed back when freed.
+/// (Fewer arenas did the same at ten times the system time.) Without a cap
+/// the allocator is left as it is.
+fn limit_heap_retention() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+        // SAFETY: `mallopt` only sets an allocator parameter; it is called
+        // before the worker pool exists.
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 4 << 20);
+        }
+    }
 }
 
 #[cfg(test)]

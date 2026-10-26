@@ -1437,80 +1437,19 @@ where
                     lattice.centre(1, low[1] + q) as isize,
                     lattice.centre(2, low[2] + r) as isize,
                 ];
-                // The sample centre, in this buffer's own indices — and `None`
-                // where the buffer does not reach it.
-                //
-                // **That case is real and it is harmless**, which is worth
-                // saying because the alternative reading is that the halo is
-                // short. The samples evaluated here bracket the *buffer*, halo
-                // included, and the outermost can sit up to a lattice distance
-                // beyond the buffer's own edge. No voxel of the block's **core**
-                // reads them: a core voxel brackets to samples within a lattice
-                // distance of itself, and the halo is that distance plus a
-                // non-negative element side. The ones not held are read only by
-                // halo voxels, whose values are discarded.
-                //
-                // So a policy about the centre is applied where there is a
-                // centre to apply it to, and elsewhere the sample is reduced
-                // like any other.
-                let held = if needs_centre {
-                    local_index(&centre, at.offset, shape)
-                } else {
-                    None
-                };
-                // The centre's own membership, asked of the mask rather than of
-                // the window's emptiness, and asked *before* the gather because
-                // under a fill there is nothing to gather it for. The same order
-                // the dense kernel asks it in.
-                if let (Some(index), Some(mask), ExcludedCentre::Fill(value)) =
-                    (held, mask.as_ref(), population.centre)
-                {
-                    if !mask[index] {
-                        grid[[p, q, r]] = value;
-                        continue;
-                    }
-                }
-                window.clear();
-                // Asked at the sample's own position in the **volume** — not in
-                // this buffer — because that is what makes the answer the same
-                // under every decomposition: the volume's faces are the same
-                // faces from inside every block, and a block seam is not one.
-                // The clamp below is still the buffer's, and still the global
-                // clamp intersected with what is held.
-                for offset in element.offsets_at(centre, at.volume, &mut offsets) {
-                    let mut index = [0usize; 3];
-                    let mut inside = true;
-                    for axis in 0..3 {
-                        // The window is stated in volume coordinates and read
-                        // out of the buffer. The buffer lies inside the volume,
-                        // so this is the global clamp intersected with what is
-                        // held — and with a sufficient halo the intersection is
-                        // the global clamp itself.
-                        let global = centre[axis] + offset[axis];
-                        let local = global - at.offset[axis] as isize;
-                        if local < 0 || local >= shape[axis] as isize {
-                            inside = false;
-                            break;
-                        }
-                        index[axis] = local as usize;
-                    }
-                    if inside {
-                        // Masked out is *out of the population*, not substituted
-                        // for: the value never joins the window, so the count
-                        // the truncation rule is resolved against is the count
-                        // that survived. Order is the element's either way, so
-                        // the surviving multiset is the same sequence under
-                        // every decomposition and the sums are the same sums.
-                        if mask.as_ref().is_some_and(|mask| !mask[index]) {
-                            continue;
-                        }
-                        window.push(input[index]);
-                    }
-                }
-                grid[[p, q, r]] = match (window.is_empty(), held, population.empty) {
-                    (true, Some(index), EmptyPopulation::Centre) => widen(input[index]),
-                    _ => reduce(&mut window),
-                };
+                grid[[p, q, r]] = sample_value(
+                    &input,
+                    mask.as_ref(),
+                    at,
+                    element,
+                    centre,
+                    population,
+                    needs_centre,
+                    &widen,
+                    &mut reduce,
+                    &mut window,
+                    &mut offsets,
+                );
             }
         }
     }
@@ -1562,6 +1501,108 @@ where
         out.map_inplace(|value| *value = narrowing.apply(*value));
     }
     Ok(())
+}
+
+/// One sample's value: the window around `centre` gathered out of the buffer
+/// `at` places, masked where there is a mask, and reduced.
+///
+/// **The one definition of a sample**, shared by the fused kernel above and by
+/// `ops::lattice_samples`, which evaluates each sample once on a global lattice
+/// instead of once per block that brackets it. Two kernels gathering the same
+/// window by two copies of this loop could drift apart in the order the window
+/// is gathered, and the order is what a summation's bits depend on.
+///
+/// `needs_centre` is whether the centre's own voxel has to be looked up at all
+/// (a mask, and a policy that asks about the centre); the caller decides it
+/// once rather than once per sample.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sample_value<T, F, W>(
+    input: &ArrayView3<'_, T>,
+    mask: Option<&ArrayView3<'_, bool>>,
+    at: &Anchor,
+    element: &StructuringElement,
+    centre: [isize; 3],
+    population: Population,
+    needs_centre: bool,
+    widen: &W,
+    reduce: &mut F,
+    window: &mut Vec<T>,
+    offsets: &mut Vec<[isize; 3]>,
+) -> f64
+where
+    T: Copy,
+    F: FnMut(&mut [T]) -> f64,
+    W: Fn(T) -> f64,
+{
+    let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
+    // The sample centre, in this buffer's own indices — and `None` where the
+    // buffer does not reach it.
+    //
+    // **That case is real and it is harmless**, which is worth saying because
+    // the alternative reading is that the halo is short. The fused kernel
+    // evaluates the samples that bracket the *buffer*, halo included, and the
+    // outermost can sit up to a lattice distance beyond the buffer's own edge.
+    // No voxel of the block's **core** reads them: a core voxel brackets to
+    // samples within a lattice distance of itself, and the halo is that
+    // distance plus a non-negative element side. The ones not held are read
+    // only by halo voxels, whose values are discarded.
+    //
+    // So a policy about the centre is applied where there is a centre to apply
+    // it to, and elsewhere the sample is reduced like any other.
+    let held = if needs_centre {
+        local_index(&centre, at.offset, shape)
+    } else {
+        None
+    };
+    // The centre's own membership, asked of the mask rather than of the
+    // window's emptiness, and asked *before* the gather because under a fill
+    // there is nothing to gather it for. The same order the dense kernel asks
+    // it in.
+    if let (Some(index), Some(mask), ExcludedCentre::Fill(value)) = (held, mask, population.centre)
+    {
+        if !mask[index] {
+            return value;
+        }
+    }
+    window.clear();
+    // Asked at the sample's own position in the **volume** — not in this buffer
+    // — because that is what makes the answer the same under every
+    // decomposition: the volume's faces are the same faces from inside every
+    // block, and a block seam is not one. The clamp below is still the
+    // buffer's, and still the global clamp intersected with what is held.
+    for offset in element.offsets_at(centre, at.volume, offsets) {
+        let mut index = [0usize; 3];
+        let mut inside = true;
+        for axis in 0..3 {
+            // The window is stated in volume coordinates and read out of the
+            // buffer. The buffer lies inside the volume, so this is the global
+            // clamp intersected with what is held — and with a sufficient halo
+            // the intersection is the global clamp itself.
+            let global = centre[axis] + offset[axis];
+            let local = global - at.offset[axis] as isize;
+            if local < 0 || local >= shape[axis] as isize {
+                inside = false;
+                break;
+            }
+            index[axis] = local as usize;
+        }
+        if inside {
+            // Masked out is *out of the population*, not substituted for: the
+            // value never joins the window, so the count the truncation rule is
+            // resolved against is the count that survived. Order is the
+            // element's either way, so the surviving multiset is the same
+            // sequence under every decomposition and the sums are the same sums.
+            if mask.is_some_and(|mask| !mask[index]) {
+                continue;
+            }
+            window.push(input[index]);
+        }
+    }
+    match (window.is_empty(), held, population.empty) {
+        (true, Some(index), EmptyPopulation::Centre) => widen(input[index]),
+        _ => reduce(window),
+    }
 }
 
 /// A volume coordinate in a buffer's own indices, or `None` where the buffer
@@ -2489,6 +2530,49 @@ impl LocalStatistic {
             };
         }
         Ok(Reach::per_axis(axes))
+    }
+
+    /// How many times the fused op evaluates each lattice point, on average,
+    /// when it runs on `grid`: one where no block's buffer brackets a sample
+    /// another block also evaluates, more as the halos overlap.
+    ///
+    /// The fused kernel evaluates every sample its buffer brackets, and the
+    /// buffer is the core widened by [`Self::halo`]; so a sample inside a halo
+    /// is evaluated once per block whose buffer holds it. This is that count,
+    /// taken per axis (the grid and the lattice are both separable) and
+    /// multiplied. It is what decides whether evaluating each sample once
+    /// (`ops::lattice_samples`, at the price of a second phase) is worth it.
+    pub fn evaluations_per_sample(&self, grid: &BlockGrid) -> Result<f64> {
+        let volume = grid.volume();
+        let block = grid.block();
+        let lattice = SampleLattice::of(&self.sampling, volume)?;
+        let mut factor = 1.0;
+        for axis in 0..3 {
+            let (window_lo, window_hi) = self.element.sides(axis);
+            let mut evaluated = 0usize;
+            let mut core_lo = 0;
+            while core_lo < volume[axis] {
+                let core_hi = (core_lo + block[axis]).min(volume[axis]);
+                // The buffer the halo table grants this block, then the samples
+                // the kernel evaluates over it: the same two steps `halo` and
+                // `sampled_statistic_into` take.
+                let (low, _, _) = self.alignment.bracket(&lattice, axis, core_lo);
+                let (_, high, _) = self.alignment.bracket(&lattice, axis, core_hi - 1);
+                let start = lattice
+                    .centre(axis, low)
+                    .saturating_sub(window_lo)
+                    .min(core_lo);
+                let end = (lattice.centre(axis, high) + window_hi)
+                    .max(core_hi - 1)
+                    .min(volume[axis] - 1);
+                let first = self.alignment.bracket(&lattice, axis, start).0;
+                let last = self.alignment.bracket(&lattice, axis, end).1;
+                evaluated += last - first + 1;
+                core_lo = core_hi;
+            }
+            factor *= evaluated as f64 / lattice.count(axis) as f64;
+        }
+        Ok(factor)
     }
 
     /// Evaluate over a `f64` buffer.

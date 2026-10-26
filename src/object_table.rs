@@ -136,10 +136,17 @@ struct Record {
     values: Vec<u64>,
 }
 
+/// What [`finalize_object_table`] buffers before it spills a sorted run.
+pub const FINALIZE_BUFFER_BYTES: u64 = 64 << 20;
+
 /// Project and finalise one fragment phase into a native object table.
 ///
-/// `temporary_parent` should be on a filesystem with space for the projected
-/// rows. Temporary files are removed on both success and ordinary errors.
+/// The projected rows go through an [`ObjectTableBuilder`] holding at most
+/// [`FINALIZE_BUFFER_BYTES`] of them: a table that fits is sorted and written
+/// from memory, a larger one spilled in sorted runs and merged. Either way
+/// the files are the same. `temporary_parent` should be on a filesystem with
+/// space for the projected rows. Temporary files are removed on both success
+/// and ordinary errors.
 pub fn finalize_object_table<F>(
     env: &dyn Environment,
     stream: &str,
@@ -148,26 +155,14 @@ pub fn finalize_object_table<F>(
     input_schema: Schema,
     output_root: impl AsRef<Path>,
     temporary_parent: impl AsRef<Path>,
-    mut spec: TableSpec,
+    spec: TableSpec,
     mut project: F,
 ) -> Result<TableReader>
 where
     F: FnMut(&Row<'_>) -> Result<Option<Vec<ObjectValue>>>,
 {
-    spec.validate().map_err(native_error)?;
-    let coordinate_columns = spec
-        .spatial_index
-        .coordinates
-        .iter()
-        .map(|coordinate| column_index(&spec, &coordinate.column))
-        .collect::<Result<Vec<_>>>()?;
-    let identity_column = column_index(&spec, &spec.identity)?;
-    let tile_count = spec.tile_count().map_err(native_error)? as usize;
-    let mut tile_counts = vec![0u64; tile_count];
-    let temporary = TemporaryDirectory::create(temporary_parent.as_ref())?;
-    let mut runs = Vec::new();
-    let mut total_rows = 0u64;
-
+    let mut builder =
+        ObjectTableBuilder::new(spec, Some(temporary_parent.as_ref()), FINALIZE_BUFFER_BYTES)?;
     fold_fragments(env, stream, &mut |key, bytes| {
         if key.phase != phase {
             return Ok(());
@@ -175,78 +170,21 @@ where
         let mut table = Table::new(volume, input_schema.clone())?;
         table.write(key.block, bytes)?;
         table.seal()?;
-        let mut records = Vec::new();
         for row in table.scan(&Region::whole(&volume))? {
-            let Some(values) = project(&row)? else {
-                continue;
-            };
-            validate_values(&spec, &values)?;
-            let tile = tile_id(&spec, &coordinate_columns, &values)?;
-            tile_counts[tile as usize] = tile_counts[tile as usize]
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid("object count overflow"))?;
-            let mut sort_key = Vec::with_capacity(coordinate_columns.len() + 2);
-            sort_key.push(tile);
-            for &column in &coordinate_columns {
-                sort_key.push(values[column].order_key()?);
+            if let Some(values) = project(&row)? {
+                builder.push(&values)?;
             }
-            sort_key.push(values[identity_column].identity()?);
-            records.push(Record {
-                key: sort_key,
-                values: values.into_iter().map(ObjectValue::bits).collect(),
-            });
-        }
-        if !records.is_empty() {
-            records.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-            let path = temporary.path.join(format!("spatial-{}.run", runs.len()));
-            write_run(&path, &records)?;
-            total_rows = total_rows
-                .checked_add(records.len() as u64)
-                .ok_or_else(|| Error::invalid("object-table row count overflow"))?;
-            runs.push(path);
         }
         Ok(())
     })?;
-
-    let key_width = coordinate_columns.len() + 2;
-    let value_width = spec.columns.len();
-    let spatial_run = collapse_runs(&temporary.path, "spatial", runs, key_width, value_width)?;
-    spec.row_count = total_rows;
-    let writer = TableWriter::create(output_root.as_ref(), spec.clone()).map_err(native_error)?;
-    let mut identity_runs = Vec::new();
-    if let Some(path) = spatial_run {
-        write_spatial_rows(
-            &writer,
-            &spec,
-            &path,
-            key_width,
-            identity_column,
-            &temporary.path,
-            &mut identity_runs,
-        )?;
-    }
-    let identity_run = collapse_runs(&temporary.path, "identity", identity_runs, 1, 1)?;
-    if let Some(path) = identity_run {
-        write_identity_rows(&writer, &spec, &path)?;
-    }
-    let mut starts = vec![0u64; tile_counts.len()];
-    let mut next = 0u64;
-    for (start, count) in starts.iter_mut().zip(&tile_counts) {
-        *start = next;
-        next = next
-            .checked_add(*count)
-            .ok_or_else(|| Error::invalid("spatial index overflow"))?;
-    }
-    writer
-        .write_spatial_index(&starts, &tile_counts)
-        .map_err(native_error)?;
-    writer.finish().map_err(native_error)
+    builder.finish(output_root)
 }
 
 /// Write rows held in memory as a native object table.
 ///
 /// The bounded-memory path is [`finalize_object_table`], which folds fragment
-/// streams. This is for rows that already sit in memory because they were
+/// streams, or an [`ObjectTableBuilder`] with a buffer limit, which takes rows
+/// one at a time. This is for rows that already sit in memory because they were
 /// assembled from somewhere else — for example one field of a time-lapse,
 /// gathered from per-frame artifacts, with a few million rows at most. The
 /// layout written is identical: rows in tile order, then by coordinates, then
@@ -254,77 +192,333 @@ where
 /// occupancy pyramid. `spec.row_count` is set from `rows`.
 pub fn write_object_rows(
     output_root: impl AsRef<Path>,
-    mut spec: TableSpec,
+    spec: TableSpec,
     rows: Vec<Vec<ObjectValue>>,
 ) -> Result<TableReader> {
-    spec.validate().map_err(native_error)?;
-    let coordinate_columns = spec
-        .spatial_index
-        .coordinates
-        .iter()
-        .map(|coordinate| column_index(&spec, &coordinate.column))
-        .collect::<Result<Vec<_>>>()?;
-    let identity_column = column_index(&spec, &spec.identity)?;
-    let tile_count = spec.tile_count().map_err(native_error)? as usize;
-    let mut tile_counts = vec![0u64; tile_count];
-    let mut records = Vec::with_capacity(rows.len());
+    let mut builder = ObjectTableBuilder::new(spec, None::<PathBuf>, u64::MAX)?;
+    builder.reserve(rows.len());
     for values in rows {
-        validate_values(&spec, &values)?;
-        let tile = tile_id(&spec, &coordinate_columns, &values)?;
-        tile_counts[tile as usize] += 1;
-        let mut key = Vec::with_capacity(coordinate_columns.len() + 2);
-        key.push(tile);
-        for &column in &coordinate_columns {
-            key.push(values[column].order_key()?);
+        builder.push(&values)?;
+    }
+    builder.finish(output_root)
+}
+
+/// Rows pushed one at a time and written as a native object table, in bounded
+/// memory.
+///
+/// A row is held as one word per column and one for its tile, nothing per row
+/// beside them. While the rows fit `buffer_bytes` ([`Self::row_bytes`] each)
+/// they are sorted and written from memory, as [`write_object_rows`] does;
+/// past it every full buffer is sorted and spilled as a run under the
+/// temporary directory, and [`Self::finish`] merges the runs as
+/// [`finalize_object_table`] does. The rows are totally ordered (tile,
+/// coordinates, identity, and identities are unique), so the table written is
+/// the same file for file whatever the buffer and whatever the push order.
+pub struct ObjectTableBuilder {
+    spec: TableSpec,
+    coordinate_columns: Vec<usize>,
+    identity_column: usize,
+    tile_counts: Vec<u64>,
+    /// Per buffered row: its tile, then its values' bits.
+    words: Vec<u64>,
+    stride: usize,
+    buffer_rows: usize,
+    temporary_parent: Option<PathBuf>,
+    temporary: Option<TemporaryDirectory>,
+    runs: Vec<PathBuf>,
+    total_rows: u64,
+}
+
+impl ObjectTableBuilder {
+    /// A table of `spec`'s columns whose buffered rows may take
+    /// `buffer_bytes`; spilled runs go under `temporary_parent`, which only a
+    /// builder that can spill needs (`u64::MAX` bytes never spills).
+    pub fn new(
+        spec: TableSpec,
+        temporary_parent: Option<impl AsRef<Path>>,
+        buffer_bytes: u64,
+    ) -> Result<Self> {
+        spec.validate().map_err(native_error)?;
+        let coordinate_columns = spec
+            .spatial_index
+            .coordinates
+            .iter()
+            .map(|coordinate| column_index(&spec, &coordinate.column))
+            .collect::<Result<Vec<_>>>()?;
+        let identity_column = column_index(&spec, &spec.identity)?;
+        let tile_count = spec.tile_count().map_err(native_error)? as usize;
+        let row_bytes = Self::row_bytes(&spec);
+        let buffer_rows = usize::try_from(buffer_bytes / row_bytes)
+            .unwrap_or(usize::MAX)
+            .clamp(1, u32::MAX as usize);
+        let temporary_parent = temporary_parent.map(|parent| parent.as_ref().to_path_buf());
+        if buffer_bytes != u64::MAX && temporary_parent.is_none() {
+            return Err(Error::invalid(
+                "an object-table builder with a buffer limit spills runs to disk and needs a \
+                 temporary directory",
+            ));
         }
-        key.push(values[identity_column].identity()?);
-        records.push(Record {
-            key,
-            values: values.into_iter().map(ObjectValue::bits).collect(),
+        Ok(Self {
+            stride: spec.columns.len() + 1,
+            spec,
+            coordinate_columns,
+            identity_column,
+            tile_counts: vec![0u64; tile_count],
+            words: Vec::new(),
+            buffer_rows,
+            temporary_parent,
+            temporary: None,
+            runs: Vec::new(),
+            total_rows: 0,
+        })
+    }
+
+    /// What one buffered row costs: a word per column and one for its tile,
+    /// plus the sort order and the identity index built from it.
+    pub fn row_bytes(spec: &TableSpec) -> u64 {
+        Self::row_bytes_of(spec.columns.len())
+    }
+
+    /// [`Self::row_bytes`] of a table of `columns` columns.
+    pub fn row_bytes_of(columns: usize) -> u64 {
+        8 * (columns as u64 + 1) + 4 + 16
+    }
+
+    /// Room for `rows` more rows, as far as the buffer limit allows.
+    pub fn reserve(&mut self, rows: usize) {
+        let room = rows.min(self.buffer_rows.saturating_sub(self.buffered()));
+        self.words.reserve_exact(room.saturating_mul(self.stride));
+    }
+
+    /// Rows pushed so far.
+    pub fn rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    fn buffered(&self) -> usize {
+        self.words.len() / self.stride
+    }
+
+    /// One row, a value per declared column in declaration order.
+    pub fn push(&mut self, values: &[ObjectValue]) -> Result<()> {
+        validate_values(&self.spec, values)?;
+        let tile = tile_id(&self.spec, &self.coordinate_columns, values)?;
+        for &column in &self.coordinate_columns {
+            values[column].order_key()?;
+        }
+        values[self.identity_column].identity()?;
+        self.tile_counts[tile as usize] = self.tile_counts[tile as usize]
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid("object count overflow"))?;
+        self.total_rows = self
+            .total_rows
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid("object-table row count overflow"))?;
+        if self.words.len() + self.stride > self.words.capacity() {
+            // Grown by doubling, but never past the limit: a doubled buffer
+            // could hold twice what it was given.
+            let limit = self.buffer_rows.saturating_mul(self.stride);
+            let room = limit.saturating_sub(self.words.len()).max(self.stride);
+            let grow = self.words.capacity().max(1024 * self.stride).min(room);
+            self.words.reserve_exact(grow);
+        }
+        self.words.push(tile);
+        self.words.extend(values.iter().map(|value| value.bits()));
+        if self.buffered() >= self.buffer_rows {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// The buffered rows in table order.
+    fn sorted(&self) -> Vec<u32> {
+        let mut keys = Vec::with_capacity(self.coordinate_columns.len());
+        for &column in &self.coordinate_columns {
+            keys.push((column + 1, self.spec.columns[column].dtype));
+        }
+        let identity = self.identity_column + 1;
+        let row = |index: u32| &self.words[index as usize * self.stride..][..self.stride];
+        let mut order: Vec<u32> = (0..self.buffered() as u32).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let (a, b) = (row(a), row(b));
+            a[0].cmp(&b[0])
+                .then_with(|| {
+                    for &(at, dtype) in &keys {
+                        let ordering = order_bits(dtype, a[at]).cmp(&order_bits(dtype, b[at]));
+                        if ordering.is_ne() {
+                            return ordering;
+                        }
+                    }
+                    Ordering::Equal
+                })
+                .then_with(|| a[identity].cmp(&b[identity]))
         });
+        order
     }
-    records.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-    spec.row_count = records.len() as u64;
-    let writer = TableWriter::create(output_root.as_ref(), spec.clone()).map_err(native_error)?;
-    let chunk = spec.row_chunk as usize;
-    for (index, block) in records.chunks(chunk).enumerate() {
-        let start = (index * chunk) as u64;
-        for (column_number, column) in spec.columns.iter().enumerate() {
-            let words: Vec<u64> = block.iter().map(|r| r.values[column_number]).collect();
-            write_column(&writer, &column.name, column.dtype, start, &words)?;
+
+    /// Sort the buffer and write it as one run of [`finalize_object_table`]'s
+    /// form: the key words (tile, coordinates' order keys, identity), then the
+    /// values.
+    fn spill(&mut self) -> Result<()> {
+        if self.words.is_empty() {
+            return Ok(());
         }
-    }
-    let mut identities: Vec<(u64, u64)> = records
-        .iter()
-        .enumerate()
-        .map(|(row, record)| (record.values[identity_column], row as u64))
-        .collect();
-    identities.sort_unstable();
-    for pair in identities.windows(2) {
-        if pair[0].0 == pair[1].0 {
-            return Err(Error::invalid(format!(
-                "object-table identity {} occurs more than once",
-                pair[0].0
-            )));
+        if self.temporary.is_none() {
+            let parent = self.temporary_parent.as_deref().ok_or_else(|| {
+                Error::invalid("an object-table builder without a temporary directory spilled")
+            })?;
+            self.temporary = Some(TemporaryDirectory::create(parent)?);
         }
+        let order = self.sorted();
+        let directory = &self.temporary.as_ref().expect("created above").path;
+        let path = directory.join(format!("spatial-{}.run", self.runs.len()));
+        let mut out = BufWriter::new(File::create(&path).map_err(Error::backend)?);
+        for index in order {
+            let row = &self.words[index as usize * self.stride..][..self.stride];
+            let mut put = |word: u64| out.write_all(&word.to_le_bytes()).map_err(Error::backend);
+            put(row[0])?;
+            for &column in &self.coordinate_columns {
+                put(order_bits(self.spec.columns[column].dtype, row[column + 1]))?;
+            }
+            put(row[self.identity_column + 1])?;
+            for &word in &row[1..] {
+                put(word)?;
+            }
+        }
+        out.flush().map_err(Error::backend)?;
+        self.runs.push(path);
+        self.words.clear();
+        Ok(())
     }
-    for (index, block) in identities.chunks(chunk).enumerate() {
-        let ids: Vec<u64> = block.iter().map(|&(id, _)| id).collect();
-        let positions: Vec<u64> = block.iter().map(|&(_, row)| row).collect();
-        writer
-            .write_identity_index((index * chunk) as u64, &ids, &positions)
-            .map_err(native_error)?;
+
+    /// Write the table at `output_root`.
+    pub fn finish(mut self, output_root: impl AsRef<Path>) -> Result<TableReader> {
+        self.spec.row_count = self.total_rows;
+        if self.runs.is_empty() {
+            return self.finish_in_memory(output_root.as_ref());
+        }
+        self.spill()?;
+        let temporary = self
+            .temporary
+            .take()
+            .expect("a spilled builder has a directory");
+        let key_width = self.coordinate_columns.len() + 2;
+        let runs = std::mem::take(&mut self.runs);
+        let spatial_run = collapse_runs(
+            &temporary.path,
+            "spatial",
+            runs,
+            key_width,
+            self.spec.columns.len(),
+        )?;
+        let writer =
+            TableWriter::create(output_root.as_ref(), self.spec.clone()).map_err(native_error)?;
+        let mut identity_runs = Vec::new();
+        if let Some(path) = spatial_run {
+            write_spatial_rows(
+                &writer,
+                &self.spec,
+                &path,
+                key_width,
+                self.identity_column,
+                &temporary.path,
+                &mut identity_runs,
+            )?;
+        }
+        let identity_run = collapse_runs(&temporary.path, "identity", identity_runs, 1, 1)?;
+        if let Some(path) = identity_run {
+            write_identity_rows(&writer, &self.spec, &path)?;
+        }
+        write_spatial_index(&writer, &self.tile_counts)?;
+        writer.finish().map_err(native_error)
     }
+
+    fn finish_in_memory(self, output_root: &Path) -> Result<TableReader> {
+        let order = self.sorted();
+        let spec = &self.spec;
+        let writer = TableWriter::create(output_root, spec.clone()).map_err(native_error)?;
+        let chunk = spec.row_chunk as usize;
+        let row = |index: u32| &self.words[index as usize * self.stride..][..self.stride];
+        let mut words = Vec::with_capacity(chunk.min(order.len()));
+        for (index, block) in order.chunks(chunk).enumerate() {
+            let start = (index * chunk) as u64;
+            for (column_number, column) in spec.columns.iter().enumerate() {
+                words.clear();
+                words.extend(block.iter().map(|&at| row(at)[column_number + 1]));
+                write_column(&writer, &column.name, column.dtype, start, &words)?;
+            }
+        }
+        let identity = self.identity_column + 1;
+        let mut identities: Vec<(u64, u64)> = order
+            .iter()
+            .enumerate()
+            .map(|(position, &at)| (row(at)[identity], position as u64))
+            .collect();
+        drop(order);
+        identities.sort_unstable();
+        for pair in identities.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(Error::invalid(format!(
+                    "object-table identity {} occurs more than once",
+                    pair[0].0
+                )));
+            }
+        }
+        let mut ids = Vec::with_capacity(chunk.min(identities.len()));
+        let mut positions = Vec::with_capacity(chunk.min(identities.len()));
+        for (index, block) in identities.chunks(chunk).enumerate() {
+            ids.clear();
+            positions.clear();
+            ids.extend(block.iter().map(|&(id, _)| id));
+            positions.extend(block.iter().map(|&(_, position)| position));
+            writer
+                .write_identity_index((index * chunk) as u64, &ids, &positions)
+                .map_err(native_error)?;
+        }
+        write_spatial_index(&writer, &self.tile_counts)?;
+        writer.finish().map_err(native_error)
+    }
+}
+
+/// The spatial index from the per-tile counts: each tile's first row and
+/// count.
+fn write_spatial_index(writer: &TableWriter, tile_counts: &[u64]) -> Result<()> {
     let mut starts = vec![0u64; tile_counts.len()];
     let mut next = 0u64;
-    for (start, count) in starts.iter_mut().zip(&tile_counts) {
+    for (start, count) in starts.iter_mut().zip(tile_counts) {
         *start = next;
-        next += *count;
+        next = next
+            .checked_add(*count)
+            .ok_or_else(|| Error::invalid("spatial index overflow"))?;
     }
     writer
-        .write_spatial_index(&starts, &tile_counts)
-        .map_err(native_error)?;
-    writer.finish().map_err(native_error)
+        .write_spatial_index(&starts, tile_counts)
+        .map_err(native_error)
+}
+
+/// [`ObjectValue::order_key`] of a value already stored as its bits (and
+/// already checked to be finite).
+fn order_bits(dtype: DType, bits: u64) -> u64 {
+    match dtype {
+        DType::U8 | DType::U16 | DType::U32 | DType::U64 => bits,
+        DType::I32 => u64::from((bits as u32) ^ (1 << 31)),
+        DType::I64 => bits ^ (1 << 63),
+        DType::F32 => {
+            let bits = bits as u32;
+            u64::from(if bits & (1 << 31) != 0 {
+                !bits
+            } else {
+                bits ^ (1 << 31)
+            })
+        }
+        DType::F64 => {
+            if bits & (1 << 63) != 0 {
+                !bits
+            } else {
+                bits ^ (1 << 63)
+            }
+        }
+    }
 }
 
 fn column_index(spec: &TableSpec, name: &str) -> Result<usize> {
@@ -817,5 +1011,118 @@ mod tests {
         );
         let duplicate = vec![row(1, 0.0, 0.0, 0.0), row(1, 1.0, 0.0, 0.0)];
         assert!(write_object_rows(scratch.path.join("dup"), spec, duplicate).is_err());
+    }
+
+    /// Every file under `root`, by its path below it, with its bytes.
+    fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    out.insert(relative, fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_spilling_builder_writes_the_table_rows_in_memory_write() {
+        let coordinate = |axis: &str| CoordinateColumn {
+            axis: axis.into(),
+            column: axis.into(),
+        };
+        let columns = vec![
+            ColumnSpec::new("id", DType::U64, ColumnRole::Identity),
+            ColumnSpec::new("z", DType::F64, ColumnRole::Coordinate),
+            ColumnSpec::new("y", DType::F32, ColumnRole::Coordinate),
+            ColumnSpec::new("x", DType::I32, ColumnRole::Coordinate),
+            ColumnSpec::new("flag", DType::U8, ColumnRole::Category),
+            ColumnSpec::new("value", DType::F64, ColumnRole::Measurement),
+            ColumnSpec::new("label", DType::I64, ColumnRole::Category),
+        ];
+        let spatial_index = SpatialIndexSpec {
+            coordinates: vec![coordinate("z"), coordinate("y"), coordinate("x")],
+            tile_shape: vec![4, 4, 4],
+            grid_shape: vec![3, 3, 3],
+            tile_order: "row_major".into(),
+            within_tile_order: "lexicographic_coordinates_then_identity".into(),
+            downsample: None,
+        };
+        let spec = TableSpec::new(0, 7, "../../", "id", columns, spatial_index);
+        // Pseudo-random rows with repeated positions, so the identity breaks
+        // ties, pushed in an order unrelated to the table's.
+        let mut state = 7u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let rows: Vec<Vec<ObjectValue>> = (0..300u64)
+            .map(|id| {
+                vec![
+                    ObjectValue::U64((id * 7919) % 1000),
+                    ObjectValue::F64((next() % 12) as f64 * 0.75),
+                    ObjectValue::F32((next() % 12) as f32),
+                    ObjectValue::I32((next() % 12) as i32),
+                    ObjectValue::U8((next() % 2) as u8),
+                    ObjectValue::F64(next() as f64 / 3.0),
+                    ObjectValue::I64(next() as i64 - 1000),
+                ]
+            })
+            .collect();
+        let scratch = TemporaryDirectory::create(&std::env::temp_dir()).unwrap();
+        let in_memory = scratch.path.join("in-memory");
+        write_object_rows(&in_memory, spec.clone(), rows.clone()).unwrap();
+        let row_bytes = ObjectTableBuilder::row_bytes(&spec);
+        for buffered in [1u64, 2, 13, 64, 299, 300, 1000] {
+            let spilled = scratch.path.join(format!("spilled-{buffered}"));
+            let mut builder =
+                ObjectTableBuilder::new(spec.clone(), Some(&scratch.path), buffered * row_bytes)
+                    .unwrap();
+            for row in rows.iter().rev() {
+                builder.push(row).unwrap();
+            }
+            assert_eq!(builder.rows(), 300);
+            builder.finish(&spilled).unwrap();
+            assert_eq!(
+                files(&in_memory),
+                files(&spilled),
+                "{buffered} rows buffered"
+            );
+        }
+        // The temporary runs are gone, and a duplicate identity is refused
+        // whether or not the builder spilled.
+        assert_eq!(
+            fs::read_dir(&scratch.path)
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".blockflow-object-table"))
+                .count(),
+            0
+        );
+        for buffered in [2u64, u64::MAX / row_bytes] {
+            let mut builder = ObjectTableBuilder::new(
+                spec.clone(),
+                Some(&scratch.path),
+                buffered.saturating_mul(row_bytes),
+            )
+            .unwrap();
+            for row in rows.iter().chain(&rows[..1]) {
+                builder.push(row).unwrap();
+            }
+            assert!(builder.finish(scratch.path.join("duplicate")).is_err());
+        }
+        assert!(ObjectTableBuilder::new(spec, None::<PathBuf>, 1 << 20).is_err());
     }
 }

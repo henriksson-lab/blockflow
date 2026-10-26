@@ -267,23 +267,28 @@ pub struct Hints {
     /// advises.
     pub slab_policy: SlabPolicy,
     /// **The memory budget blocks in flight are admitted against**, or `None`
-    /// for no admission (waves of `concurrency`, as before admission existed).
+    /// for no admission (up to `concurrency` blocks in flight, as before
+    /// admission existed).
     ///
     /// The default is [`crate::budget::process_budget`]: the process's memory
-    /// cap, shared with every chunk cache. Each block of a wave leases its
-    /// phase's [`active_bytes_per_block`] charge; a block that does not fit
-    /// beside the wave already admitted — after the caches have been asked to
-    /// give bytes back — waits for the next wave, and the first block of a
-    /// wave is always admitted, so a plan whose one block exceeds the budget
-    /// runs one block at a time rather than not at all. With room to spare
-    /// every wave is `concurrency` blocks, exactly as without it.
+    /// cap, shared with every chunk cache. Blocks are admitted **as room
+    /// frees**, not in waves: each leases its phase's [`active_bytes_per_block`]
+    /// charge when it starts and returns it when it finishes, and the next
+    /// ready block starts as soon as its charge fits beside the blocks in
+    /// flight (after the caches have been asked to give bytes back). A block
+    /// with nothing else in flight is always admitted, so a plan whose one
+    /// block exceeds the budget runs one block at a time rather than not at
+    /// all. With room to spare `concurrency` blocks are always in flight,
+    /// exactly as without it.
     ///
-    /// Near the budget (a full wave of the plan's widest phase charged at more
+    /// Near the budget (a full set of the plan's widest phase charged at more
     /// than half of it) the executor also **measures**: the resident set
-    /// outside the budget's leases is charged to each wave, and a phase whose
-    /// blocks are seen to hold more than they were charged is charged what was
-    /// seen. So a prediction that runs low lowers the blocks in flight instead
-    /// of breaking the cap.
+    /// outside the budget's leases is leased as such, re-measured whenever
+    /// nothing is in flight and raised whenever the resident set exceeds what
+    /// is leased; and a phase's charge becomes what its blocks were seen to
+    /// hold, learned only while blocks of that phase alone are in flight
+    /// (see `Admission`). So a prediction that runs low lowers the blocks in
+    /// flight instead of breaking the cap.
     ///
     /// Advisory like the rest of this struct: it changes how many blocks run
     /// at once, never which voxels they write.
@@ -399,16 +404,39 @@ pub fn execute(
 /// between two samples.
 const SEEN_MARGIN: u64 = 4;
 
-/// Whether `BLOCKFLOW_ADMISSION_LOG` is set: one line per measured wave on
-/// standard error (phases, blocks, resident set, what they held and were
-/// charged). Diagnostics only.
+/// What a phase's first blocks — its probe, admitted from a quiet moment
+/// before anything is known of what they hold, and any block that joins it
+/// before it has been measured — are charged, as a multiple of
+/// the plan's charge: so that a probe takes at most half the budget at the
+/// plan's figure, the same headroom a phase never probed has (it is probed
+/// only when a full set of its blocks would be over half). A figure under what
+/// the blocks hold by up to this factor (over the op margin already in the
+/// plan's charge) is measured rather than breaking the cap.
+const PROBE_HEADROOM: u64 = 2;
+
+/// The share of the budget (`1 / RESIDENT_SLACK`) the resident set may be over
+/// everything leased before admission stops admitting blocks: a block between
+/// two samples, the heap the allocator has not handed back.
+const RESIDENT_SLACK: u64 = 16;
+
+/// Whether `BLOCKFLOW_ADMISSION_LOG` is set: one line on standard error per
+/// measurement admission takes (a phase's first figure, a raised figure, a
+/// resident set over what is leased). Diagnostics only.
 fn admission_log() -> bool {
     static LOG: OnceLock<bool> = OnceLock::new();
     *LOG.get_or_init(|| std::env::var_os("BLOCKFLOW_ADMISSION_LOG").is_some())
 }
 
-/// The executor's memory admission: how many blocks of a wave fit the budget.
-/// See [`Hints::memory`].
+/// The executor's memory admission: whether the next block fits the budget
+/// beside the blocks already in flight. See [`Hints::memory`].
+///
+/// **Blocks are admitted one at a time as room frees**, not in waves: a block
+/// that finishes returns its lease and the next ready block is admitted at
+/// once if its charge fits. What waves gave the measurement — a moment with
+/// nothing in flight, at which the resident set is exactly what no block
+/// holds — is kept by an **epoch**: it starts at such a quiet moment, and while
+/// every block admitted since is of one phase, the resident set's peak over
+/// the quiet figure is what that phase's blocks held.
 struct Admission {
     budget: crate::budget::MemoryBudget,
     /// Per phase: what the plan charges one block ([`active_bytes_per_block`]).
@@ -418,10 +446,45 @@ struct Admission {
     floor: Vec<u64>,
     /// Per phase: the most one block was seen to hold, when measuring.
     seen: Vec<Option<u64>>,
-    /// Present when the run is near its budget: the resident set's peak per wave.
+    /// Per phase: whether a full set of its blocks at the plan's charge is
+    /// near the budget, so that what a block holds decides how many run. Only
+    /// such a phase waits for a quiet moment to be measured; any other runs at
+    /// the plan's charge (which carries the op margin) from the start.
+    gated: Vec<bool>,
+    /// Present when the run is near its budget: the resident set's peak.
     sampler: Option<crate::budget::ResidentSampler>,
-    /// The resident set and the caches' leases when the current wave started.
-    started: (u64, u64),
+    /// The blocks in flight: their phase and their lease.
+    flight: BTreeMap<usize, (usize, crate::budget::Lease)>,
+    /// When measuring: the resident set no lease accounts for (the binary, the
+    /// heap the allocator kept, anything a plan does not see), leased so that
+    /// the blocks admitted are what the cap leaves. Measured at each quiet
+    /// moment and raised, never lowered, between them.
+    unaccounted: Option<crate::budget::Lease>,
+    /// The unaccounted lease could not be had: one block at a time until the
+    /// next quiet moment.
+    over: bool,
+    /// The measurement since the last quiet moment.
+    epoch: Option<Epoch>,
+}
+
+/// What admission measures between two quiet moments; see [`Admission`].
+struct Epoch {
+    /// The phase of every block admitted since the quiet moment, while `pure`.
+    phase: usize,
+    /// A block of another phase was admitted since: nothing more is learned.
+    pure: bool,
+    /// The resident set and the caches' leases at the quiet moment.
+    resident: u64,
+    cached: u64,
+    /// The blocks admitted at the quiet moment while the phase had no figure
+    /// yet — its first measurement, taken when the last of them finishes — and
+    /// how many they were.
+    probe: BTreeSet<usize>,
+    probe_len: usize,
+    /// A block admitted in this epoch has finished, so the probe is formed.
+    finished_any: bool,
+    /// The most blocks of the phase in flight at once since the quiet moment.
+    most: usize,
 }
 
 impl Admission {
@@ -429,37 +492,45 @@ impl Admission {
         budget: crate::budget::MemoryBudget,
         chain: &Chain,
         decomposition: &Decomposition,
+        work: &[PhaseWork<'_>],
         concurrency: usize,
     ) -> Self {
-        let planned = active_bytes_per_block(chain, decomposition);
-        let floor = expected_bytes_per_block(chain, decomposition);
-        // Near the budget: a full wave of the widest phase at more than half.
-        let widest_wave = planned
+        let planned = active_bytes_per_block_with(chain, decomposition, work);
+        let floor = expected_bytes_per_block_with(chain, decomposition, work);
+        // A phase is near the budget when a full set of its blocks at the
+        // plan's charge is more than half of it, and the run is near when any
+        // phase is.
+        let near_phase: Vec<bool> = planned
             .iter()
             .zip(&decomposition.phases)
             .map(|(&bytes, phase)| {
-                bytes.saturating_mul(concurrency.min(phase.grid.n_blocks()) as u64)
+                bytes
+                    .saturating_mul(concurrency.min(phase.grid.n_blocks()) as u64)
+                    .saturating_mul(2)
+                    > budget.total()
             })
-            .max()
-            .unwrap_or(0);
-        let near = widest_wave.saturating_mul(2) > budget.total();
+            .collect();
+        let near = near_phase.iter().any(|&near| near);
         Self {
             seen: vec![None; planned.len()],
+            gated: near_phase,
             planned,
             floor,
             sampler: near.then(crate::budget::ResidentSampler::start).flatten(),
             budget,
-            started: (0, 0),
+            flight: BTreeMap::new(),
+            unaccounted: None,
+            over: false,
+            epoch: None,
         }
     }
 
-    /// What one block of `phase` is charged: the plan's figure until a wave of
-    /// the phase has been measured, then the most a block of it was seen to
-    /// hold plus [`SEEN_MARGIN`] — **lower** than the plan's figure as often as
-    /// higher, since that figure carries a margin for op scratch nothing
-    /// declares (measured at 1.3x to 5.5x what the vessel pipeline's phases
-    /// hold), and a cap is no reason to run a phase at a third of the blocks
-    /// it can afford.
+    /// What one block of `phase` is charged: the plan's figure until the phase
+    /// has been measured, then the most a block of it was seen to hold plus
+    /// [`SEEN_MARGIN`] — **lower** than the plan's figure as often as higher,
+    /// since that figure carries a margin for op scratch nothing declares
+    /// (measured at 1.3x to 5.5x what the vessel pipeline's phases hold), and a
+    /// cap is no reason to run a phase at a third of the blocks it can afford.
     fn charge(&self, phase: usize) -> u64 {
         match self.seen.get(phase).copied().flatten() {
             Some(seen) => seen
@@ -470,103 +541,299 @@ impl Admission {
         }
     }
 
-    /// Pop the next wave from `ready`: up to `concurrency` blocks, each leasing
-    /// its charge, stopping at the first that does not fit. The first is
-    /// admitted whatever it costs.
-    fn form_wave(
-        &mut self,
-        ready: &mut BinaryHeap<Reverse<([usize; 5], usize)>>,
-        graph: &TaskGraph,
-        concurrency: usize,
-        prepared: &BTreeMap<usize, PreparedFragment>,
-    ) -> (Vec<usize>, Vec<crate::budget::Lease>) {
-        let mut leases = Vec::new();
-        let mut over = false;
-        if let Some(sampler) = &self.sampler {
-            // What is resident and leased by nobody: the binary, the heap the
-            // allocator could not return, anything a plan does not see. Charged
-            // to the wave, so the blocks admitted are what the cap leaves.
-            crate::budget::release_freed_heap();
-            let resident = crate::budget::resident_bytes().unwrap_or(0);
-            let unaccounted = resident.saturating_sub(self.budget.in_use());
-            match self.budget.try_acquire_reclaiming(unaccounted) {
-                Some(lease) => leases.push(lease),
-                // Already over: one block at a time until the resident set
-                // comes back under.
-                None => over = true,
+    /// A quiet moment: nothing in flight. Re-measure what no lease accounts
+    /// for and start an epoch for `phase`.
+    fn quiet(&mut self, phase: usize) {
+        let Some(sampler) = &self.sampler else {
+            return;
+        };
+        drop(self.unaccounted.take());
+        // glibc keeps freed block buffers; without handing them back the
+        // resident set would be the last blocks' high-water mark.
+        crate::budget::release_freed_heap();
+        let resident = crate::budget::resident_bytes().unwrap_or(0);
+        let unaccounted = resident.saturating_sub(self.budget.in_use());
+        match self.budget.try_acquire_reclaiming(unaccounted) {
+            Some(lease) => {
+                self.unaccounted = Some(lease);
+                self.over = false;
             }
-            sampler.reset(resident);
-            self.started = (resident, self.budget.opportunistic_in_use());
-        }
-        let mut wave = Vec::new();
-        let concurrency = if over { 1 } else { concurrency };
-        while wave.len() < concurrency {
-            let Some(&Reverse((_, id))) = ready.peek() else {
-                break;
-            };
-            // Only completed tasks may shed their compute/scratch reservation.
-            // Active tasks retain the conservative phase charge even with small reads.
-            let charge = prepared
-                .get(&id)
-                .and_then(|p| p.completion_charge)
-                .unwrap_or_else(|| {
-                    self.charge(graph.tasks[id].phase)
-                        .saturating_sub(prepared.get(&id).map_or(0, |p| p.saved_source_bytes))
-                        .max(1)
-                });
-            match self.budget.try_acquire_reclaiming(charge) {
-                Some(lease) => leases.push(lease),
-                None if wave.is_empty() => {}
-                None => break,
-            }
-            ready.pop();
-            wave.push(id);
-        }
-        (wave, leases)
-    }
-
-    /// After a wave: when measuring, charge each phase in it at least what
-    /// its blocks were seen to hold, then return the wave's leases.
-    fn wave_done(&mut self, wave: &[usize], graph: &TaskGraph, leases: Vec<crate::budget::Lease>) {
-        if let Some(sampler) = &self.sampler {
-            let (resident, cached) = self.started;
-            let grown_cache = self.budget.opportunistic_in_use().saturating_sub(cached);
-            let held = sampler
-                .peak()
-                .saturating_sub(resident)
-                .saturating_sub(grown_cache);
-            // **Learned from waves of one phase only.** A wave can hold blocks
-            // of two (the next phase's first blocks are ready before the last of
-            // this one's), and no division of one peak between two phases is
-            // safe: the blocks of the two do not peak together, so an even
-            // share, or one in proportion to the plan's charges, taught the
-            // dearer phase a figure under what its blocks held — measured on
-            // the vessel pipeline at a third under for the tubeness phase and a
-            // fifth under for the equalisation, and the next wave broke the cap
-            // both times.
-            let first = graph.tasks[wave[0]].phase;
-            if wave.iter().all(|&id| graph.tasks[id].phase == first) {
-                let per_block = held / wave.len().max(1) as u64;
-                if let Some(seen) = self.seen.get_mut(first) {
-                    *seen = Some(seen.map_or(per_block, |old| old.max(per_block)));
+            // Already over: one block at a time until the resident set comes
+            // back under.
+            None => {
+                self.over = true;
+                if admission_log() {
+                    eprintln!(
+                        "admission: quiet at {} MiB resident, {unaccounted_mib} MiB unleased does \
+                         not fit: one block at a time",
+                        resident >> 20,
+                        unaccounted_mib = unaccounted >> 20
+                    );
                 }
             }
-            if admission_log() {
-                let phases: BTreeSet<usize> =
-                    wave.iter().map(|&id| graph.tasks[id].phase).collect();
-                eprintln!(
-                    "admission: phases {phases:?}, {} blocks, resident {} MiB at start, peak {} \
-                     MiB, held {} MiB against {} MiB charged, caches {} MiB",
-                    wave.len(),
-                    resident >> 20,
-                    sampler.peak() >> 20,
-                    held >> 20,
-                    leases.iter().map(|lease| lease.bytes()).sum::<u64>() >> 20,
-                    self.budget.opportunistic_in_use() >> 20
-                );
+        }
+        sampler.reset(resident);
+        self.epoch = Some(Epoch {
+            phase,
+            pure: true,
+            resident,
+            cached: self.budget.opportunistic_in_use(),
+            probe: BTreeSet::new(),
+            probe_len: 0,
+            finished_any: false,
+            most: 0,
+        });
+    }
+
+    /// Admit block `id` of `phase`, leasing `charge` (or the phase's charge),
+    /// or answer `false`: wait for a block in flight to finish. A block with nothing else in flight is always admitted,
+    /// whatever it costs, so a plan whose one block exceeds the budget runs one
+    /// block at a time rather than not at all.
+    ///
+    /// When measuring, **a phase with no figure yet is admitted only from a
+    /// quiet moment**, and nothing of another phase joins it until the blocks
+    /// admitted then have finished: its first figure is the epoch's peak over
+    /// the quiet resident set divided by those blocks, the measurement a wave
+    /// of one phase gave. More blocks of the same phase may join it as room
+    /// frees, at the plan's charge; what they hold lands on the same peak and
+    /// is divided among fewer blocks, which errs high. **No figure is learned
+    /// from blocks of two phases in flight together**: the blocks of the two
+    /// do not peak together, so no division of one peak between them is safe
+    /// (an even share, or one in proportion to the plan's charges, taught the
+    /// dearer phase a figure under what its blocks held — measured on the
+    /// vessel pipeline at a third under for the tubeness phase and a fifth
+    /// under for the equalisation, and the next wave broke the cap both times).
+    fn admit(&mut self, id: usize, phase: usize, charge: Option<u64>) -> bool {
+        let idle = self.flight.is_empty();
+        let mut probe = false;
+        let mut unmeasured = false;
+        if self.sampler.is_some() {
+            if idle {
+                self.quiet(phase);
+            } else if self.over {
+                return self.wait(phase, "over the budget until nothing is in flight");
+            } else if self.resident_over() {
+                return self.wait(phase, "the resident set is over what is leased");
+            }
+            unmeasured = self.needs_probe(phase);
+            let probing = self
+                .epoch
+                .as_ref()
+                .is_some_and(|epoch| self.needs_probe(epoch.phase));
+            if let Some(epoch) = self.epoch.as_mut() {
+                if epoch.phase != phase {
+                    if probing {
+                        return self.wait(phase, "another phase's first blocks are measured");
+                    }
+                    if unmeasured {
+                        return self
+                            .wait(phase, "a phase with no figure starts from a quiet moment");
+                    }
+                    epoch.pure = false;
+                } else if unmeasured && !epoch.finished_any {
+                    probe = true;
+                }
             }
         }
-        drop(leases);
+        let mut charge = charge.unwrap_or_else(|| self.charge(phase)).max(1);
+        // The probe, and any block that joins it before it has finished.
+        if unmeasured {
+            charge = charge.saturating_mul(PROBE_HEADROOM);
+        }
+        let lease = match self.budget.try_acquire_reclaiming(charge) {
+            Some(lease) => lease,
+            None if idle => crate::budget::Lease::unbudgeted(),
+            None => return self.wait(phase, "its charge does not fit"),
+        };
+        self.flight.insert(id, (phase, lease));
+        if let Some(epoch) = self.epoch.as_mut() {
+            if probe {
+                epoch.probe.insert(id);
+                epoch.probe_len = epoch.probe.len();
+            }
+            if epoch.pure {
+                let of_phase = self
+                    .flight
+                    .values()
+                    .filter(|(p, _)| *p == epoch.phase)
+                    .count();
+                epoch.most = epoch.most.max(of_phase);
+            }
+        }
+        true
+    }
+
+    /// Whether the resident set, as last sampled, is over everything leased by
+    /// more than a [`RESIDENT_SLACK`] share of the budget: a block holds more
+    /// than it was charged. The blocks in flight cannot be stopped, but no more
+    /// are admitted until one finishes ([`Self::done`] then leases what is
+    /// missing), and the phase the epoch is measuring is charged at least what
+    /// its blocks are holding now — which catches a phase whose figure is
+    /// under what its blocks hold although it was never near the budget at
+    /// that figure, so was never probed.
+    fn resident_over(&mut self) -> bool {
+        let Some(sampler) = &self.sampler else {
+            return false;
+        };
+        let resident = sampler.latest();
+        let leased = self.budget.in_use();
+        if resident <= leased.saturating_add(self.budget.total() / RESIDENT_SLACK) {
+            return false;
+        }
+        if let Some(epoch) = self.epoch.as_ref().filter(|epoch| epoch.pure) {
+            let phase = epoch.phase;
+            let of_phase = self.flight.values().filter(|(p, _)| *p == phase).count();
+            let grown_cache = self
+                .budget
+                .opportunistic_in_use()
+                .saturating_sub(epoch.cached);
+            let held = resident
+                .saturating_sub(epoch.resident)
+                .saturating_sub(grown_cache);
+            if of_phase > 0 {
+                self.raise(phase, held / of_phase as u64, "holding");
+            }
+        }
+        if admission_log() {
+            eprintln!(
+                "admission: resident {} MiB, {} MiB leased: over what is leased; {} in flight",
+                resident >> 20,
+                leased >> 20,
+                self.flight.len()
+            );
+        }
+        true
+    }
+
+    /// Raise `phase`'s figure to `per_block` if that is more, **never lowering
+    /// it**: a phase with no figure yet takes one only above what the plan
+    /// charges it, since a figure replaces the plan's charge.
+    fn raise(&mut self, phase: usize, per_block: u64, how: &str) {
+        let planned = self.planned.get(phase).copied().unwrap_or(0);
+        let Some(seen) = self.seen.get_mut(phase) else {
+            return;
+        };
+        let before = *seen;
+        match *seen {
+            Some(old) => *seen = Some(old.max(per_block)),
+            None if per_block > planned => *seen = Some(per_block),
+            None => {}
+        }
+        if admission_log() && before != *seen {
+            eprintln!(
+                "admission: phase {phase} raised to {} MiB a block ({how})",
+                per_block >> 20
+            );
+        }
+    }
+
+    /// Whether `phase` must be measured from a quiet moment before more of
+    /// its blocks run: it is near the budget and has no figure yet.
+    fn needs_probe(&self, phase: usize) -> bool {
+        self.gated.get(phase).copied().unwrap_or(false)
+            && self.seen.get(phase).is_some_and(Option::is_none)
+    }
+
+    /// Refuse a block of `phase` for `why` (logged when asked).
+    fn wait(&self, phase: usize, why: &str) -> bool {
+        if admission_log() {
+            eprintln!(
+                "admission: a block of phase {phase} waits: {why} ({} in flight, {} MiB of {} \
+                 MiB leased, charge {} MiB)",
+                self.flight.len(),
+                self.budget.in_use() >> 20,
+                self.budget.total() >> 20,
+                self.charge(phase) >> 20
+            );
+        }
+        false
+    }
+
+    /// Block `id` finished: return its lease, and when measuring learn what
+    /// its epoch says and check the resident set against what is leased.
+    fn done(&mut self, id: usize) {
+        let Some((phase, lease)) = self.flight.remove(&id) else {
+            return;
+        };
+        drop(lease);
+        let Some(sampler) = &self.sampler else {
+            return;
+        };
+        if let Some(epoch) = self.epoch.as_mut() {
+            epoch.finished_any = true;
+            if epoch.pure && epoch.phase == phase {
+                let grown_cache = self
+                    .budget
+                    .opportunistic_in_use()
+                    .saturating_sub(epoch.cached);
+                let held = sampler
+                    .peak()
+                    .saturating_sub(epoch.resident)
+                    .saturating_sub(grown_cache);
+                let seen = &mut self.seen[phase];
+                let learned = if epoch.probe.remove(&id) {
+                    // The phase's first figure, once every block of its probe
+                    // has finished; a block's peak is anywhere in its life.
+                    (epoch.probe.is_empty() && seen.is_none())
+                        .then(|| held / epoch.probe_len.max(1) as u64)
+                } else if seen.is_none() && !self.gated[phase] {
+                    // A phase never probed, because it was not near the budget
+                    // at the plan's charge: what its blocks held raises the
+                    // figure when it is over that charge (`raise`), and is
+                    // otherwise not taken.
+                    let per_block = held / epoch.most.max(1) as u64;
+                    (per_block > self.planned[phase]).then_some(per_block)
+                } else {
+                    // Later blocks of a pure epoch can only raise the figure:
+                    // a block still running when the peak is read may not
+                    // have reached its own.
+                    seen.map(|_| held / epoch.most.max(1) as u64)
+                };
+                if let Some(per_block) = learned {
+                    let before = *seen;
+                    *seen = Some(seen.map_or(per_block, |old| old.max(per_block)));
+                    if admission_log() && before != *seen {
+                        eprintln!(
+                            "admission: phase {phase} seen at {} MiB a block (held {} MiB over \
+                             {} MiB at the quiet moment, {} in flight at most)",
+                            per_block >> 20,
+                            held >> 20,
+                            epoch.resident >> 20,
+                            epoch.most
+                        );
+                    }
+                }
+            }
+        }
+        // Between quiet moments: a resident set over everything leased is
+        // memory no lease accounts for — a block over its charge, or the heap
+        // grown — and is leased as such until the next quiet moment.
+        let resident = crate::budget::resident_bytes().unwrap_or(0);
+        if resident > self.budget.in_use() {
+            crate::budget::release_freed_heap();
+            let resident = crate::budget::resident_bytes().unwrap_or(0);
+            let missing = resident.saturating_sub(self.budget.in_use());
+            if missing > 0 && !self.flight.is_empty() {
+                let raised = self
+                    .unaccounted
+                    .as_ref()
+                    .map_or(0, crate::budget::Lease::bytes)
+                    .saturating_add(missing);
+                drop(self.unaccounted.take());
+                match self.budget.try_acquire_reclaiming(raised) {
+                    Some(lease) => self.unaccounted = Some(lease),
+                    None => self.over = true,
+                }
+                if admission_log() {
+                    eprintln!(
+                        "admission: resident {} MiB, {} MiB over what is leased; {} in flight",
+                        resident >> 20,
+                        missing >> 20,
+                        self.flight.len()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -753,10 +1020,15 @@ pub fn execute_phases(
         .then(|| worker_pool(concurrency))
         .transpose()?;
 
-    let mut admission = hints
-        .memory
-        .as_ref()
-        .map(|budget| Admission::new(budget.clone(), &workflow.chain, decomposition, concurrency));
+    let mut admission = hints.memory.as_ref().map(|budget| {
+        Admission::new(
+            budget.clone(),
+            &workflow.chain,
+            decomposition,
+            work,
+            concurrency,
+        )
+    });
 
     let mut indegree: Vec<usize> = graph.tasks.iter().map(Task::n_dependencies).collect();
     let dependents = graph.dependents();
@@ -803,7 +1075,7 @@ pub fn execute_phases(
     let mut barrier_released: Vec<bool> = vec![false; n_phases];
     // One blob per phase, empty for every phase whose op takes the default
     // `reduce` and for every phase that is not a barrier.
-    let mut reduced: Vec<Vec<u8>> = vec![Vec::new(); n_phases];
+    let mut reduced: Vec<Arc<[u8]>> = vec![Arc::from(Vec::new()); n_phases];
     // A heap rather than a sorted vector: the ready set is re-ranked on every
     // wave, and re-sorting it was O(waves x ready x log ready) — around 3 x 10^8
     // comparisons at full scale, which would have made the *scheduler* the
@@ -846,370 +1118,499 @@ pub fn execute_phases(
     let mut short_circuited = 0usize;
 
     let mut prepared_tasks = BTreeMap::new();
-    while done < graph.len() {
-        // **The gate, and the one thing that goes in the gap it creates.**
-        // Every earlier phase has finished and no block of this phase has
-        // started. That is the only moment at which the fragment set is complete
-        // and untouched, so it is where `FragmentOp::reduce` runs: once, for the
-        // phase, rather than once per block from inside `apply` where the op
-        // would have nowhere to put the answer and would re-derive it `blocks`
-        // times.
-        //
-        // Then the held tasks join the ready heap like any others. They are
-        // ranked by the same priority key, popped in the same waves and run
-        // concurrently with each other and with whatever else is ready: a
-        // barrier constrains when a phase may *start*, not how it runs. Anything
-        // admitted after this point goes straight to the heap, because `admit`
-        // consults `barrier_released`.
-        for phase in 0..n_phases {
-            if !barrier[phase]
-                || barrier_released[phase]
-                || (0..phase).any(|earlier| phase_remaining[earlier] > 0)
-            {
-                continue;
-            }
-            reduced[phase] = reduce_phase(decomposition, phase, work, env)?;
-            barrier_released[phase] = true;
-            for id in std::mem::take(&mut barrier_held[phase]) {
-                ready.push(Reverse((priority_key(&graph.tasks[id], hints), id)));
-            }
+    // Images whose last reader has finished but whose writer has not, with the
+    // reader that freed them.
+    let mut deferred_discards: Vec<(usize, usize)> = Vec::new();
+    // The blocks in flight report here when they finish. With one worker there
+    // is no pool, and a block runs where it is admitted.
+    let serial = pool.is_none();
+    let serial_pool;
+    let scope_pool: &rayon::ThreadPool = match pool.as_deref() {
+        Some(pool) => pool,
+        None => {
+            serial_pool = worker_pool(1)?;
+            &serial_pool
         }
-        // An iterative phase whose every task is ready runs now, as a whole,
-        // before anything is popped: it is a barrier by construction and there is
-        // no benefit to interleaving other work around it in a serial executor.
-        let pending = (0..n_phases).find(|&phase| {
-            iterative[phase]
-                && !iterative_run[phase]
-                && iterative_ready[phase] == graph.tasks_in_phase(phase).len()
-        });
-        let completed: Vec<(usize, TaskOutcome)> = match pending {
-            Some(phase) => {
-                iterative_run[phase] = true;
-                if !phase_started[phase] {
-                    phase_started[phase] = true;
-                    events.emit(Event::PhaseStarted { phase });
-                }
-                for task in graph.tasks_in_phase(phase) {
-                    events.emit(Event::TaskAdmitted {
-                        phase,
-                        index: task.index,
-                    });
-                }
-                let (ran, changes, outcomes) = match &work[phase] {
-                    PhaseWork::Iterate(op) => run_iterative_phase(
-                        &graph,
-                        phase,
-                        decomposition,
-                        *op,
-                        env,
-                        &events,
-                        n_phases,
-                        pool.as_deref(),
-                    )?,
-                    PhaseWork::IterateReduce(op) => run_iterative_reduce_phase(
-                        &graph,
-                        phase,
-                        decomposition,
-                        *op,
-                        env,
-                        &events,
-                        pool.as_deref(),
-                    )?,
-                    _ => unreachable!("`iterative` is derived from `work`"),
-                };
-                substages[phase] = ran;
-                substage_changes[phase] = changes;
-                graph
-                    .tasks_in_phase(phase)
-                    .iter()
-                    .map(|task| task.id)
-                    .zip(outcomes)
-                    .collect()
+    };
+    let (sender, receiver) = std::sync::mpsc::channel::<Finished>();
+    let mut finished_here: std::collections::VecDeque<Finished> = Default::default();
+    let mut in_flight = 0usize;
+    let limits = max_in_flight_per_phase(&workflow.chain, decomposition);
+    let mut phase_in_flight = vec![0usize; n_phases];
+    let mut admitted_so_far = 0usize;
+    let mut failure: Option<(usize, Error)> = None;
+    let mut panicked: Option<Box<dyn std::any::Any + Send>> = None;
+    let (graph_ref, slots_ref, events_ref) = (&graph, &slots, &events);
+    scope_pool.in_place_scope(|scope| -> Result<()> {
+        while done < graph.len() {
+            if (failure.is_some() || panicked.is_some()) && in_flight == 0 {
+                break;
             }
-            None => {
-                if ready.is_empty() {
-                    return Err(Error::InvalidArgument(format!(
+            // **The gate, and the one thing that goes in the gap it creates.**
+            // Every earlier phase has finished and no block of this phase has
+            // started. That is the only moment at which the fragment set is complete
+            // and untouched, so it is where `FragmentOp::reduce` runs: once, for the
+            // phase, rather than once per block from inside `apply` where the op
+            // would have nowhere to put the answer and would re-derive it `blocks`
+            // times.
+            //
+            // Then the held tasks join the ready heap like any others. They are
+            // ranked by the same priority key, popped in the same waves and run
+            // concurrently with each other and with whatever else is ready: a
+            // barrier constrains when a phase may *start*, not how it runs. Anything
+            // admitted after this point goes straight to the heap, because `admit`
+            // consults `barrier_released`.
+            for phase in 0..n_phases {
+                if !barrier[phase]
+                    || barrier_released[phase]
+                    || (0..phase).any(|earlier| phase_remaining[earlier] > 0)
+                {
+                    continue;
+                }
+                reduced[phase] = Arc::from(reduce_phase(decomposition, phase, work, env)?);
+                barrier_released[phase] = true;
+                for id in std::mem::take(&mut barrier_held[phase]) {
+                    ready.push(Reverse((priority_key(&graph.tasks[id], hints), id)));
+                }
+            }
+            // An iterative phase whose every task is ready runs now, as a whole,
+            // before anything is popped: it is a barrier by construction and there is
+            // no benefit to interleaving other work around it in a serial executor.
+            let pending = (0..n_phases).find(|&phase| {
+                iterative[phase]
+                    && !iterative_run[phase]
+                    && iterative_ready[phase] == graph.tasks_in_phase(phase).len()
+            });
+            let completed: Vec<(usize, TaskOutcome)> = match pending {
+                Some(phase) if in_flight == 0 => {
+                    iterative_run[phase] = true;
+                    if !phase_started[phase] {
+                        phase_started[phase] = true;
+                        events.emit(Event::PhaseStarted { phase });
+                    }
+                    for task in graph.tasks_in_phase(phase) {
+                        events.emit(Event::TaskAdmitted {
+                            phase,
+                            index: task.index,
+                        });
+                    }
+                    let (ran, changes, outcomes) = match &work[phase] {
+                        PhaseWork::Iterate(op) => run_iterative_phase(
+                            &graph,
+                            phase,
+                            decomposition,
+                            *op,
+                            env,
+                            &events,
+                            n_phases,
+                            pool.as_deref(),
+                        )?,
+                        PhaseWork::IterateReduce(op) => run_iterative_reduce_phase(
+                            &graph,
+                            phase,
+                            decomposition,
+                            *op,
+                            env,
+                            &events,
+                            pool.as_deref(),
+                        )?,
+                        _ => unreachable!("`iterative` is derived from `work`"),
+                    };
+                    substages[phase] = ran;
+                    substage_changes[phase] = changes;
+                    graph
+                        .tasks_in_phase(phase)
+                        .iter()
+                        .map(|task| task.id)
+                        .zip(outcomes)
+                        .collect()
+                }
+                _ => {
+                    // **Blocks stream.** As many ready blocks are admitted as there
+                    // are free workers and room under the budget; then the loop
+                    // waits for one to finish, and the next round admits into the
+                    // room it left. Nothing waits for the slowest block of a wave.
+                    //
+                    // Nothing is admitted while an iterative phase is pending (it
+                    // runs as a whole once the blocks in flight have finished) or
+                    // after a block has failed (the run stops once they have).
+                    let admitting = pending.is_none() && failure.is_none() && panicked.is_none();
+                    if admitting && in_flight == 0 && ready.is_empty() {
+                        return Err(Error::InvalidArgument(format!(
                         "task graph stalled after {done} of {} tasks; this is a dependency cycle, \
                          which a phase-layered DAG cannot have unless the graph was built wrongly",
                         graph.len()
                     )));
-                }
-                // Ready means all declared metadata dependencies are durable. Bound
-                // lookahead to one wave; cache decisions until the task is admitted.
-                let mut candidates = Vec::new();
-                if work
-                    .iter()
-                    .any(|w| matches!(w, PhaseWork::Fragments(op) if op.prepares()))
-                {
-                    for _ in 0..concurrency.min(ready.len()) {
-                        candidates.push(ready.pop().unwrap());
                     }
-                    prepared_tasks.retain(|id, _| candidates.iter().any(|key| key.0 .1 == *id));
-                    for key in &candidates {
-                        let id = key.0 .1;
-                        if let PhaseWork::Fragments(op) = &work[graph.tasks[id].phase] {
-                            if op.prepares() && !prepared_tasks.contains_key(&id) {
-                                let task = &graph.tasks[id];
-                                let prepared = prepare_fragment_task(
-                                    task,
-                                    decomposition,
-                                    *op,
-                                    env,
-                                    &events,
-                                    &reduced[task.phase],
-                                )?;
-                                prepared_tasks.insert(id, prepared);
-                            }
-                        }
-                    }
-                    ready.extend(candidates);
-                }
-                let (wave, leases) = match admission.as_mut() {
-                    None => {
-                        let take = concurrency.min(ready.len());
-                        let wave: Vec<usize> = (0..take)
-                            .map(|_| ready.pop().expect("checked non-empty").0 .1)
-                            .collect();
-                        (wave, Vec::new())
-                    }
-                    Some(admission) => {
-                        admission.form_wave(&mut ready, &graph, concurrency, &prepared_tasks)
-                    }
-                };
-
-                for &id in &wave {
-                    let phase = graph.tasks[id].phase;
-                    if !phase_started[phase] {
-                        phase_started[phase] = true;
-                        events.emit(Event::PhaseStarted { phase });
-                        // **Declare the phase's reads, once, in plan order.**
-                        //
-                        // Here rather than per wave because the rank *is* the
-                        // plan's order and does not change as waves are
-                        // dispatched — re-submitting each wave would re-rank on
-                        // what has just run, which is recency, and
-                        // `Environment::prefetch` documents why that is the one
-                        // thing the rank must not be. The environment truncates
-                        // to its own lookahead; nothing is predicted, since
-                        // these are the reads the plan will make.
-                        //
-                        // Advisory in the strongest sense: the default
-                        // implementation does nothing, an error here would be
-                        // an error about a fetch nobody has waited for, and a
-                        // demand read serves every one of these anyway. So it
-                        // is not allowed to fail the run.
-                        //
-                        // **Image `phase` only, which is a stated limitation.**
-                        // The images a source leaf reads
-                        // (`PhaseDecomposition::source_images`) are not declared
-                        // here: a source arm's regions are that leaf's, not this
-                        // phase's, so declaring them means asking each leaf what
-                        // it will read — worth doing, with a measurement rather
-                        // than a guess.
-                        if hints.prefetch_depth > 0
-                            && !matches!(&work[phase],
-                            PhaseWork::Fragments(op) if op.prepares())
-                        {
-                            let regions: Vec<Region> = graph
-                                .tasks_in_phase(phase)
+                    let mut admitted = Vec::new();
+                    if admitting {
+                        let free = concurrency.saturating_sub(in_flight);
+                        // Ready means all declared metadata dependencies are
+                        // durable. Bound lookahead to the free workers; cache
+                        // decisions until the task is admitted.
+                        if free > 0
+                            && work
                                 .iter()
-                                .map(|task| task.geometry.source.clone())
-                                .collect();
-                            let _ = env.prefetch(phase, &regions);
+                                .any(|w| matches!(w, PhaseWork::Fragments(op) if op.prepares()))
+                        {
+                            let mut candidates = Vec::new();
+                            for _ in 0..free.min(ready.len()) {
+                                candidates.push(ready.pop().unwrap());
+                            }
+                            prepared_tasks
+                                .retain(|id, _| candidates.iter().any(|key| key.0 .1 == *id));
+                            for key in &candidates {
+                                let id = key.0 .1;
+                                if let PhaseWork::Fragments(op) = &work[graph.tasks[id].phase] {
+                                    if op.prepares() && !prepared_tasks.contains_key(&id) {
+                                        let task = &graph.tasks[id];
+                                        let prepared = prepare_fragment_task(
+                                            task,
+                                            decomposition,
+                                            *op,
+                                            env,
+                                            &events,
+                                            &reduced[task.phase],
+                                        )?;
+                                        prepared_tasks.insert(id, prepared);
+                                    }
+                                }
+                            }
+                            ready.extend(candidates);
+                        }
+                        while in_flight + admitted.len() < concurrency {
+                            let Some(&Reverse((_, id))) = ready.peek() else {
+                                break;
+                            };
+                            // An op that says how many of its blocks can usefully run at
+                            // once (one device) is held to it.
+                            if limits[graph.tasks[id].phase].is_some_and(|limit| {
+                                phase_in_flight[graph.tasks[id].phase] >= limit
+                            }) {
+                                break;
+                            }
+                            if let Some(admission) = admission.as_mut() {
+                                // Only completed tasks may shed their compute/scratch
+                                // reservation. Active tasks retain the conservative
+                                // phase charge even with small reads.
+                                let phase = graph.tasks[id].phase;
+                                let charge = prepared_tasks.get(&id).map(|p| {
+                                    p.completion_charge.unwrap_or_else(|| {
+                                        admission
+                                            .charge(phase)
+                                            .saturating_sub(p.saved_source_bytes)
+                                            .max(1)
+                                    })
+                                });
+                                if !admission.admit(id, phase, charge) {
+                                    break;
+                                }
+                            }
+                            ready.pop();
+                            phase_in_flight[graph.tasks[id].phase] += 1;
+                            admitted.push(id);
                         }
                     }
-                    events.emit(Event::TaskAdmitted {
-                        phase,
-                        index: graph.tasks[id].index,
-                    });
-                }
 
-                if hints.prefetch_depth > 0 {
-                    let mut requests = BTreeMap::<usize, Vec<(u32, Region)>>::new();
-                    for &id in &wave {
-                        let Some(p) = prepared_tasks.get(&id) else {
-                            continue;
+                    for &id in &admitted {
+                        let phase = graph.tasks[id].phase;
+                        if !phase_started[phase] {
+                            phase_started[phase] = true;
+                            events.emit(Event::PhaseStarted { phase });
+                            // **Declare the phase's reads, once, in plan order.**
+                            //
+                            // Here rather than per admission because the rank *is*
+                            // the plan's order and does not change as blocks are
+                            // dispatched — re-submitting each round would re-rank on
+                            // what has just run, which is recency, and
+                            // `Environment::prefetch` documents why that is the one
+                            // thing the rank must not be. The environment truncates
+                            // to its own lookahead; nothing is predicted, since
+                            // these are the reads the plan will make.
+                            //
+                            // Advisory in the strongest sense: the default
+                            // implementation does nothing, an error here would be
+                            // an error about a fetch nobody has waited for, and a
+                            // demand read serves every one of these anyway. So it
+                            // is not allowed to fail the run.
+                            //
+                            // **Image `phase` only, which is a stated limitation.**
+                            // The images a source leaf reads
+                            // (`PhaseDecomposition::source_images`) are not declared
+                            // here: a source arm's regions are that leaf's, not this
+                            // phase's, so declaring them means asking each leaf what
+                            // it will read — worth doing, with a measurement rather
+                            // than a guess.
+                            if hints.prefetch_depth > 0
+                                && !matches!(&work[phase],
+                            PhaseWork::Fragments(op) if op.prepares())
+                            {
+                                let regions: Vec<Region> = graph
+                                    .tasks_in_phase(phase)
+                                    .iter()
+                                    .map(|task| task.geometry.source.clone())
+                                    .collect();
+                                let _ = env.prefetch(phase, &regions);
+                            }
+                        }
+                        events.emit(Event::TaskAdmitted {
+                            phase,
+                            index: graph.tasks[id].index,
+                        });
+                    }
+
+                    if hints.prefetch_depth > 0 {
+                        let mut requests = BTreeMap::<usize, Vec<(u32, Region)>>::new();
+                        for &id in &admitted {
+                            let Some(p) = prepared_tasks.get(&id) else {
+                                continue;
+                            };
+                            use crate::fragment::BlockPreparation;
+                            if matches!(&p.decision, BlockPreparation::Complete { .. }) {
+                                continue;
+                            }
+                            let task = &graph.tasks[id];
+                            let phase = &decomposition.phases[task.phase];
+                            let rank = id.min(u32::MAX as usize) as u32;
+                            if phase.reads_input_image {
+                                requests
+                                    .entry(task.phase)
+                                    .or_default()
+                                    .push((rank, task.geometry.source.clone()));
+                            }
+                            match &p.decision {
+                                BlockPreparation::ReadWindows(windows) => {
+                                    for w in windows {
+                                        requests
+                                            .entry(w.image)
+                                            .or_default()
+                                            .push((rank, w.region.clone()));
+                                    }
+                                }
+                                BlockPreparation::Run => {
+                                    for &image in &phase.source_images {
+                                        requests
+                                            .entry(image)
+                                            .or_default()
+                                            .push((rank, task.geometry.source.clone()));
+                                    }
+                                }
+                                BlockPreparation::Complete { .. } => unreachable!(),
+                            }
+                        }
+                        for (image, regions) in requests {
+                            let _ = env.prefetch_prepared(image, &regions);
+                        }
+                    }
+
+                    for id in admitted {
+                        let phase = graph.tasks[id].phase;
+                        // **The planner's rule, evaluated per phase and nowhere
+                        // else.** `n_blocks` is the phase's own lattice, from the
+                        // plan rather than from how many tasks happen to be ready:
+                        // the question the rule answers is "does this lattice leave
+                        // workers parked", which is a property of the plan and must
+                        // give the same answer whatever order the heap emptied in.
+                        // On a plan with work for every worker this is `1` and the
+                        // block runs exactly as it did before slabs existed.
+                        //
+                        // **One budget, not two, and the arithmetic is why.** The
+                        // design note's §10 flags that threads spawned inside a task
+                        // are not the pool's, so `n_blocks x slabs` could exceed the
+                        // machine with nothing noticing. It cannot here: at most
+                        // `concurrency` tasks are in flight, a phase of `n` blocks
+                        // contributes at most `n` of them, and each is allotted
+                        // `floor(concurrency / n)` slabs — so one phase's blocks
+                        // spend at most `concurrency` threads. Two phases cannot
+                        // both be one-block and both in flight, because a one-block
+                        // phase's task depends on the whole of the phase below it.
+                        // The bound is the plan's shape rather than a clamp, which
+                        // is why there is no clamp.
+                        let slabs = hints
+                            .slab_policy
+                            .slabs_for(concurrency, decomposition.phases[phase].blocks.len());
+                        let prepared = prepared_tasks.remove(&id);
+                        let reduced_here = Arc::clone(&reduced[phase]);
+                        let order = admitted_so_far;
+                        admitted_so_far += 1;
+                        in_flight += 1;
+                        let run = move || {
+                            run_task(
+                                &graph_ref.tasks[id],
+                                decomposition,
+                                slots_ref,
+                                &work[phase],
+                                env,
+                                events_ref,
+                                n_phases,
+                                &reduced_here,
+                                slabs,
+                                prepared.as_ref(),
+                            )
                         };
-                        use crate::fragment::BlockPreparation;
-                        if matches!(&p.decision, BlockPreparation::Complete { .. }) {
-                            continue;
-                        }
-                        let task = &graph.tasks[id];
-                        let phase = &decomposition.phases[task.phase];
-                        let rank = id.min(u32::MAX as usize) as u32;
-                        if phase.reads_input_image {
-                            requests
-                                .entry(task.phase)
-                                .or_default()
-                                .push((rank, task.geometry.source.clone()));
-                        }
-                        match &p.decision {
-                            BlockPreparation::ReadWindows(windows) => {
-                                for w in windows {
-                                    requests
-                                        .entry(w.image)
-                                        .or_default()
-                                        .push((rank, w.region.clone()));
-                                }
-                            }
-                            BlockPreparation::Run => {
-                                for &image in &phase.source_images {
-                                    requests
-                                        .entry(image)
-                                        .or_default()
-                                        .push((rank, task.geometry.source.clone()));
-                                }
-                            }
-                            BlockPreparation::Complete { .. } => unreachable!(),
+                        if serial {
+                            // One worker: the block runs here, now, as it always
+                            // has, and a panic unwinds straight through.
+                            finished_here.push_back((id, order, Ok(run())));
+                        } else {
+                            let sender = sender.clone();
+                            scope.spawn(move |_| {
+                                let outcome =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+                                // The receiver outlives the scope.
+                                let _ = sender.send((id, order, outcome));
+                            });
                         }
                     }
-                    for (image, regions) in requests {
-                        let _ = env.prefetch_prepared(image, &regions);
+
+                    let mut gathered = Vec::new();
+                    if in_flight > 0 {
+                        let mut finished = Vec::new();
+                        if serial {
+                            finished.extend(finished_here.drain(..));
+                        } else {
+                            finished.push(next_finished(&receiver));
+                            finished.extend(receiver.try_iter());
+                        }
+                        for (id, order, outcome) in finished {
+                            in_flight -= 1;
+                            phase_in_flight[graph.tasks[id].phase] -= 1;
+                            if let Some(admission) = admission.as_mut() {
+                                admission.done(id);
+                            }
+                            match outcome {
+                                Ok(Ok(outcome)) => gathered.push((id, outcome)),
+                                // The first block admitted among those that failed
+                                // decides the error, as the first of a wave did.
+                                Ok(Err(error)) => {
+                                    if failure.as_ref().is_none_or(|(first, _)| order < *first) {
+                                        failure = Some((order, error));
+                                    }
+                                }
+                                Err(payload) => {
+                                    panicked.get_or_insert(payload);
+                                }
+                            }
+                        }
                     }
+                    if failure.is_some() || panicked.is_some() {
+                        // Stop: no completion is recorded once a block has failed.
+                        gathered.clear();
+                    }
+                    gathered
                 }
+            };
 
-                let run = |id: usize| {
-                    let phase = graph.tasks[id].phase;
-                    // **The planner's rule, evaluated per phase and nowhere
-                    // else.** `n_blocks` is the phase's own lattice, from the
-                    // plan rather than from how many tasks happen to be ready:
-                    // the question the rule answers is "does this lattice leave
-                    // workers parked", which is a property of the plan and must
-                    // give the same answer whatever order the heap emptied in.
-                    // On a plan with work for every worker this is `1` and the
-                    // block runs exactly as it did before slabs existed.
+            for (id, outcome) in completed {
+                let phase = graph.tasks[id].phase;
+                for (name, region) in &outcome.side_written {
+                    side_written
+                        .get_mut(name)
+                        .expect("every side output a task writes was declared")
+                        .push(region.ranges());
+                }
+                written[phase].push(region_to_ranges(&outcome.valid));
+                phase_bytes[phase] += outcome.valid.voxels() as u64
+                    * decomposition.dtype_at(phase + 1).size_of() as u64;
+                if outcome.short_circuited {
+                    short_circuited += 1;
+                }
+                phase_remaining[phase] -= 1;
+                if phase_remaining[phase] == 0 {
+                    // Every image whose **last** reader is this phase is now dead.
                     //
-                    // **One budget, not two, and the arithmetic is why.** The
-                    // design note's §10 flags that threads spawned inside a task
-                    // are not the pool's, so `n_blocks x slabs` could exceed the
-                    // machine with nothing noticing. It cannot here: the wave is
-                    // at most `min(concurrency, ready)` tasks, a phase of `n`
-                    // blocks contributes at most `n` ready tasks, and each is
-                    // allotted `floor(concurrency / n)` slabs — so one phase's
-                    // wave spends at most `concurrency` threads. Two phases
-                    // cannot both be one-block and both ready, because a
-                    // one-block phase's task depends on the whole of the phase
-                    // below it. The bound is the plan's shape rather than a
-                    // clamp, which is why there is no clamp.
-                    let slabs = hints
-                        .slab_policy
-                        .slabs_for(concurrency, decomposition.phases[phase].blocks.len());
-                    run_task(
-                        &graph.tasks[id],
-                        decomposition,
-                        &slots,
-                        &work[phase],
-                        env,
-                        &events,
-                        n_phases,
-                        &reduced[phase],
-                        slabs,
-                        prepared_tasks.get(&id),
-                    )
-                };
-                let outcomes: Vec<Result<TaskOutcome>> = match &pool {
-                    None => wave.iter().map(|&id| run(id)).collect(),
-                    Some(pool) => pool.install(|| wave.par_iter().map(|&id| run(id)).collect()),
-                };
-                if let Some(admission) = admission.as_mut() {
-                    admission.wave_done(&wave, &graph, leases);
-                }
-                let mut gathered = Vec::with_capacity(wave.len());
-                for (&id, outcome) in wave.iter().zip(outcomes) {
-                    prepared_tasks.remove(&id);
-                    gathered.push((id, outcome?));
-                }
-                gathered
-            }
-        };
-
-        for (id, outcome) in completed {
-            let phase = graph.tasks[id].phase;
-            for (name, region) in &outcome.side_written {
-                side_written
-                    .get_mut(name)
-                    .expect("every side output a task writes was declared")
-                    .push(region.ranges());
-            }
-            written[phase].push(region_to_ranges(&outcome.valid));
-            phase_bytes[phase] +=
-                outcome.valid.voxels() as u64 * decomposition.dtype_at(phase + 1).size_of() as u64;
-            if outcome.short_circuited {
-                short_circuited += 1;
-            }
-            phase_remaining[phase] -= 1;
-            if phase_remaining[phase] == 0 {
-                // Every image whose **last** reader is this phase is now dead.
-                //
-                // The last reader rather than "the image `phase` reads": a
-                // source leaf gives an image a second reader further on, and
-                // freeing it here would free something still wanted.
-                // `images_dead_after` answers `[phase]` for every plan without
-                // one, so nothing else changes.
-                //
-                // The saving is the whole point of `Visibility`: without this an
-                // `N`-phase chain holds `N + 1` full images for the length of
-                // the run, and only ever two of them are live.
-                //
-                // `Internal` **or** released, with `keep_images` winning over
-                // both, is `Decomposition::image_freeable`, and it is asked
-                // there rather than here so that the residency walks that
-                // predict this moment cannot answer it differently. The phase
-                // goes with the image, so that a reader who wanted it back is
-                // told which `keep_images` entry they needed rather than only
-                // that it is gone.
-                for image in decomposition.images_freed_after(
-                    phase,
-                    &hints.release_images,
-                    &hints.keep_images,
-                ) {
-                    env.discard_image_after(image, phase)?;
-                }
-                if work[phase].writes_an_image() {
-                    // A phase that wrote no image has nothing to flush and
-                    // nothing to materialise, and saying otherwise would put a
-                    // byte count on the stream for bytes never written.
-                    env.finish(phase + 1)?;
-                    events.emit(Event::Materialised {
-                        phase,
-                        image: phase + 1,
-                        bytes: phase_bytes[phase],
-                        intermediate: phase + 1 < n_phases,
-                    });
-                }
-                if let PhaseWork::Fragments(op) = &work[phase] {
-                    // The guard on the side this phase's output is actually on.
-                    // The tiling check below runs over valid regions, which for
-                    // a fragment phase are the cores and therefore tile
-                    // whatever happened; this is the check that can fail.
+                    // The last reader rather than "the image `phase` reads": a
+                    // source leaf gives an image a second reader further on, and
+                    // freeing it here would free something still wanted.
+                    // `images_dead_after` answers `[phase]` for every plan without
+                    // one, so nothing else changes.
                     //
-                    // A later barrier that reduces over this phase's stream runs
-                    // the same check again from `reduce_phase`, and that
-                    // repetition is deliberate — see `reduce_phase`'s own doc
-                    // for what it costs and why the alternatives are worse. This
-                    // is the copy that runs for a phase *no* barrier reads, and
-                    // the copy that fails at the phase which made the hole
-                    // rather than at whatever comes after it.
-                    super::fragment::check_fragment_coverage(env, decomposition, phase, *op)?;
-                }
-            }
-            for &next in &dependents[id] {
-                indegree[next] -= 1;
-                if indegree[next] == 0 {
-                    admit(
-                        &graph.tasks[next],
-                        hints,
-                        &iterative,
-                        &barrier,
-                        &mut ready,
-                        &mut iterative_ready,
-                        &mut barrier_held,
-                        &barrier_released,
+                    // The saving is the whole point of `Visibility`: without this an
+                    // `N`-phase chain holds `N + 1` full images for the length of
+                    // the run, and only ever two of them are live.
+                    //
+                    // `Internal` **or** released, with `keep_images` winning over
+                    // both, is `Decomposition::image_freeable`, and it is asked
+                    // there rather than here so that the residency walks that
+                    // predict this moment cannot answer it differently. The phase
+                    // goes with the image, so that a reader who wanted it back is
+                    // told which `keep_images` entry they needed rather than only
+                    // that it is gone.
+                    //
+                    // **And only once the phase that writes it has finished too.**
+                    // A reader depends on the writer's blocks it reads, not on all
+                    // of them: a phase that reads part of its input (a crop) can
+                    // finish while a block writing the rest is still in flight, and
+                    // freeing the image under that block fails its write.
+                    deferred_discards.extend(
+                        decomposition
+                            .images_freed_after(phase, &hints.release_images, &hints.keep_images)
+                            .into_iter()
+                            .map(|image| (image, phase)),
                     );
+                    let mut still_deferred = Vec::new();
+                    for (image, reader) in std::mem::take(&mut deferred_discards) {
+                        let writer = image.checked_sub(1).filter(|&writer| writer < n_phases);
+                        if writer.is_some_and(|writer| phase_remaining[writer] > 0) {
+                            still_deferred.push((image, reader));
+                        } else {
+                            env.discard_image_after(image, reader)?;
+                        }
+                    }
+                    deferred_discards = still_deferred;
+                    if work[phase].writes_an_image() {
+                        // A phase that wrote no image has nothing to flush and
+                        // nothing to materialise, and saying otherwise would put a
+                        // byte count on the stream for bytes never written.
+                        env.finish(phase + 1)?;
+                        events.emit(Event::Materialised {
+                            phase,
+                            image: phase + 1,
+                            bytes: phase_bytes[phase],
+                            intermediate: phase + 1 < n_phases,
+                        });
+                    }
+                    if let PhaseWork::Fragments(op) = &work[phase] {
+                        // The guard on the side this phase's output is actually on.
+                        // The tiling check below runs over valid regions, which for
+                        // a fragment phase are the cores and therefore tile
+                        // whatever happened; this is the check that can fail.
+                        //
+                        // A later barrier that reduces over this phase's stream runs
+                        // the same check again from `reduce_phase`, and that
+                        // repetition is deliberate — see `reduce_phase`'s own doc
+                        // for what it costs and why the alternatives are worse. This
+                        // is the copy that runs for a phase *no* barrier reads, and
+                        // the copy that fails at the phase which made the hole
+                        // rather than at whatever comes after it.
+                        super::fragment::check_fragment_coverage(env, decomposition, phase, *op)?;
+                    }
                 }
+                for &next in &dependents[id] {
+                    indegree[next] -= 1;
+                    if indegree[next] == 0 {
+                        admit(
+                            &graph.tasks[next],
+                            hints,
+                            &iterative,
+                            &barrier,
+                            &mut ready,
+                            &mut iterative_ready,
+                            &mut barrier_held,
+                            &barrier_released,
+                        );
+                    }
+                }
+                done += 1;
             }
-            done += 1;
         }
+        Ok(())
+    })?;
+    if let Some(payload) = panicked {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some((_, error)) = failure {
+        return Err(error);
     }
 
     // The guard again, on what was *actually* written rather than on what the
@@ -1522,6 +1923,34 @@ fn worker_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>> {
     );
     pools.insert(threads, Arc::clone(&pool));
     Ok(pool)
+}
+
+/// A block that finished: its task, its place in the admission order, and
+/// what running it produced (or the panic it raised).
+type Finished = (usize, usize, std::thread::Result<Result<TaskOutcome>>);
+
+/// Wait for the next block in flight to finish. On a thread of a pool (an
+/// executor run from inside a block of another) the wait runs that pool's
+/// queued work rather than parking a thread the blocks may need.
+fn next_finished(receiver: &std::sync::mpsc::Receiver<Finished>) -> Finished {
+    loop {
+        if let Ok(finished) = receiver.try_recv() {
+            return finished;
+        }
+        match rayon::yield_now() {
+            Some(rayon::Yield::Executed) => {}
+            Some(rayon::Yield::Idle) => {
+                if let Ok(finished) = receiver.recv_timeout(std::time::Duration::from_micros(100)) {
+                    return finished;
+                }
+            }
+            None => {
+                return receiver
+                    .recv()
+                    .expect("the sender outlives every block in flight")
+            }
+        }
+    }
 }
 
 /// What running one `(block, phase)` task produced.
@@ -3667,8 +4096,8 @@ pub struct ChosenGrid<T> {
 pub struct ActiveSet {
     /// Bytes one block in flight is expected to hold
     /// ([`expected_bytes_per_block`]). The executor's admission charges the
-    /// first wave of the phase this figure with the op margin, and later waves
-    /// what that wave was measured to hold ([`Hints::memory`]).
+    /// phase's first blocks this figure with the op margin, and later blocks
+    /// what the first were measured to hold ([`Hints::memory`]).
     pub per_block: u64,
     /// Blocks in flight: the workers, the phase's blocks, or what the budget
     /// holds, whichever is fewest.
@@ -3687,11 +4116,45 @@ impl ActiveSet {
 /// through [`crate::budget::admission_bytes`]. What [`choose_grid`] plans the
 /// blocks in flight with and what the executor's admission charges.
 pub fn active_bytes_per_block(chain: &Chain, decomposition: &Decomposition) -> Vec<u64> {
+    active_bytes_per_block_with(chain, decomposition, &[])
+}
+
+/// [`active_bytes_per_block`] with each fragment phase's own
+/// [`FragmentOp::scratch_bytes`](crate::fragment::FragmentOp::scratch_bytes)
+/// added: what the planner and the executor's admission charge. `work` may be
+/// empty, which adds nothing.
+pub fn active_bytes_per_block_with(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    work: &[PhaseWork<'_>],
+) -> Vec<u64> {
+    let scratch = scratch_bytes_per_block(decomposition, work);
     (0..decomposition.n_phases())
         .map(|phase| {
             crate::budget::admission_bytes(crate::budget::FrameworkFigure::Assumed(
-                decomposition.active_bytes_per_block(chain, phase),
+                decomposition.active_bytes_per_block(chain, phase) + scratch[phase] as f64,
             ))
+        })
+        .collect()
+}
+
+/// Per phase: the bytes its fragment op says one block allocates beyond the
+/// phase's buffers ([`FragmentOp::scratch_bytes`](crate::fragment::FragmentOp::scratch_bytes)),
+/// at its largest block. Zero for every other phase, whose buffers the plan
+/// counts from its chain.
+pub fn scratch_bytes_per_block(decomposition: &Decomposition, work: &[PhaseWork<'_>]) -> Vec<u64> {
+    decomposition
+        .phases
+        .iter()
+        .enumerate()
+        .map(|(index, phase)| match work.get(index) {
+            Some(PhaseWork::Fragments(op)) => phase
+                .blocks
+                .iter()
+                .map(|block| op.scratch_bytes(block.read.shape3()))
+                .max()
+                .unwrap_or(0),
+            _ => 0,
         })
         .collect()
 }
@@ -3705,11 +4168,25 @@ pub fn active_bytes_per_block(chain: &Chain, decomposition: &Decomposition) -> V
 /// ran a third of the blocks it could afford — or, to keep the blocks in
 /// flight, a finer grid paying a halo per block. The margin is applied where a
 /// wrong figure would break the cap rather than slow the run: the executor's
-/// first wave of each phase is charged with it, and later waves what the
-/// first was measured to hold, never less than this figure.
+/// first blocks of each phase are charged with it, and later blocks what the
+/// first were measured to hold, never less than this figure.
 pub fn expected_bytes_per_block(chain: &Chain, decomposition: &Decomposition) -> Vec<u64> {
+    expected_bytes_per_block_with(chain, decomposition, &[])
+}
+
+/// [`expected_bytes_per_block`] with each fragment phase's own scratch added,
+/// as [`active_bytes_per_block_with`] adds it.
+pub fn expected_bytes_per_block_with(
+    chain: &Chain,
+    decomposition: &Decomposition,
+    work: &[PhaseWork<'_>],
+) -> Vec<u64> {
+    let scratch = scratch_bytes_per_block(decomposition, work);
     (0..decomposition.n_phases())
-        .map(|phase| decomposition.active_bytes_per_block(chain, phase).ceil() as u64)
+        .map(|phase| {
+            (decomposition.active_bytes_per_block(chain, phase) + scratch[phase] as f64).ceil()
+                as u64
+        })
         .collect()
 }
 
@@ -3730,6 +4207,24 @@ pub fn expected_bytes_per_block(chain: &Chain, decomposition: &Decomposition) ->
 /// that is less than the phase's re-read bytes the shortfall is charged once
 /// more at the model's read cost — a miss re-reads storage. With room to spare
 /// the term is zero, so an uncapped plan is priced exactly as before.
+/// Per phase: the most blocks that can usefully be in flight at once, from
+/// its ops' [`crate::op::BlockOp::max_in_flight`], or `None` for no limit.
+pub fn max_in_flight_per_phase(chain: &Chain, decomposition: &Decomposition) -> Vec<Option<usize>> {
+    let slots = chain.slots();
+    decomposition
+        .phases
+        .iter()
+        .map(|phase| {
+            phase
+                .slots
+                .iter()
+                .filter_map(|&slot| slots.get(slot).and_then(|chain| chain.max_in_flight()))
+                .min()
+                .map(|limit| limit.max(1))
+        })
+        .collect()
+}
+
 pub fn price_under_budget(
     chain: &Chain,
     decomposition: &Decomposition,
@@ -3739,7 +4234,8 @@ pub fn price_under_budget(
     budget_bytes: u64,
 ) -> Result<(f64, Vec<ActiveSet>)> {
     let workers = workers.max(1);
-    let per_block = expected_bytes_per_block(chain, decomposition);
+    let per_block = expected_bytes_per_block_with(chain, decomposition, work);
+    let limits = max_in_flight_per_phase(chain, decomposition);
     if let Some((phase, &needed)) = per_block
         .iter()
         .enumerate()
@@ -3756,13 +4252,15 @@ pub fn price_under_budget(
         .phases
         .iter()
         .zip(&per_block)
-        .map(|(phase, &bytes)| {
+        .zip(&limits)
+        .map(|((phase, &bytes), limit)| {
             let held = budget_bytes.checked_div(bytes).unwrap_or(u64::MAX);
             ActiveSet {
                 per_block: bytes,
                 in_flight: workers
                     .min(phase.grid.n_blocks())
                     .min(usize::try_from(held).unwrap_or(usize::MAX))
+                    .min(limit.unwrap_or(usize::MAX))
                     .max(1),
             }
         })
@@ -3837,11 +4335,14 @@ pub fn choose_grid<T>(
             break;
         }
         let priced = build(grid.clone()).and_then(|(assembly, built)| {
-            let needed =
-                expected_bytes_per_block(&assembly.workflow.chain, &assembly.decomposition)
-                    .into_iter()
-                    .max()
-                    .unwrap_or(0);
+            let needed = expected_bytes_per_block_with(
+                &assembly.workflow.chain,
+                &assembly.decomposition,
+                &assembly.work(),
+            )
+            .into_iter()
+            .max()
+            .unwrap_or(0);
             least_needed = Some(least_needed.map_or(needed, |least| least.min(needed)));
             let (makespan, active) = price_under_budget(
                 &assembly.workflow.chain,

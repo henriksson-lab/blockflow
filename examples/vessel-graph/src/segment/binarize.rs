@@ -30,7 +30,20 @@
 //! `sliding` for the two wide masked percentiles (the lightsheet line and the
 //! vessel-background disk), `local` for the sampled window statistics and the
 //! adaptive isodata threshold, `smooth` for the deconvolution's flat blur and
-//! `ridge` (`RatioResponse`) for the tubeness. The two arms with an expensive
+//! `ridge` (`RatioResponse`) for the tubeness.
+//!
+//! The three sampled window statistics (lightsheet background, equalize
+//! percentiles, adaptive threshold) have two forms that write the same bytes.
+//! Fused (`local::LocalStatisticOp`), each block evaluates every lattice point
+//! its halo brackets, so where halos overlap a point is evaluated by several
+//! blocks. Once (`lattice_samples`), a fragment phase evaluates each point in
+//! the block whose core holds it, a second hands each block the points its
+//! voxels bracket, and a third interpolates them and combines them with the
+//! voxels they are compared against.
+//! Which one is used is decided per statistic against the plan's grid
+//! ([`EVALUATE_ONCE_ABOVE`]).
+//!
+//! The two arms with an expensive
 //! op inside them — the blur in `deconvolve`, the disk percentile and the
 //! Hessian in `vesselize` — are sequences handed to `PlanBuilder::partition`,
 //! so the planner may give the wide-halo step a phase of its own instead of
@@ -39,8 +52,13 @@
 //! Axis order is `(z, y, x)`. The lightsheet correction runs along `x`, the
 //! deconvolution blur and the vessel-background disk are in the `(y, x)` plane.
 
+use std::sync::Arc;
+
 use blockflow::op::Chain;
 use blockflow::ops::element::{ElementShape, Rank, StructuringElement};
+use blockflow::ops::lattice_samples::{
+    append_lattice_sample_phases, LatticeSamplesOp, SampleCombine,
+};
 use blockflow::ops::local::{
     AdaptiveThresholdOp, Isodata, LocalStatistic, LocalStatisticOp, Narrowing, Rounding, Sampling,
     Statistic,
@@ -51,7 +69,8 @@ use blockflow::ops::ridge::{Boundary, Polarity, RatioResponse, RidgeFilterOp, Sc
 use blockflow::ops::sliding::{Domain, SlidingHistogramOp};
 use blockflow::ops::smooth::{Gaussian, SmoothOp};
 use blockflow::ops::voxelwise::{
-    CarryOp, FnCombine, Logic, LogicCombine, NarrowOp, VoxelwiseMapOp, VoxelwiseMaskOp, WidenOp,
+    from_set, is_set, CarryOp, FnCombine, Logic, LogicCombine, NarrowOp, VoxelwiseMapOp,
+    VoxelwiseMaskOp, WidenOp,
 };
 use blockflow::{Dtype, Error, Result};
 
@@ -358,22 +377,64 @@ fn sliding_percentile(
     .with_excluded_centre(ExcludedCentre::Fill(0.0)))
 }
 
-fn statistic_percentile(
-    name: &'static str,
+fn rank_statistic(
     element: StructuringElement,
     spacing: [usize; 3],
     percentile: f64,
-    population: Image,
-) -> Result<LocalStatisticOp> {
-    Ok(LocalStatisticOp::new(
-        name,
-        LocalStatistic::sampled(
-            element,
-            Sampling::every(spacing),
-            Statistic::Rank(Rank::ceiling_percentile(percentile)?),
-        )?,
+) -> Result<LocalStatistic> {
+    LocalStatistic::sampled(
+        element,
+        Sampling::every(spacing),
+        Statistic::Rank(Rank::ceiling_percentile(percentile)?),
     )
-    .masked_by(population.id))
+}
+
+/// Evaluate a sampled window statistic once per lattice point when the fused
+/// op would evaluate each point at least this many times on the plan's grid.
+///
+/// Evaluating once costs two more phases — a gather of fragments and an
+/// interpolation pass — so it pays only where the fused op's halos overlap
+/// enough to redo real work: a z slab under a window several planes thick, or
+/// any grid that cuts the image plane under a 200-voxel window. A window one
+/// plane thick on a grid that leaves `y` and `x` whole (the lightsheet
+/// background on a slab grid) evaluates each point once either way, and stays
+/// fused.
+const EVALUATE_ONCE_ABOVE: f64 = 1.5;
+
+/// Whether `statistic` is evaluated once on the global lattice rather than
+/// fused into each block. Both write the same bytes, so this is a cost choice;
+/// `VESSEL_GRAPH_WINDOWS=fused` or `=once` forces one way, for measuring.
+fn evaluate_once(c: &Cursor<'_>, statistic: &LocalStatistic) -> Result<bool> {
+    match std::env::var("VESSEL_GRAPH_WINDOWS").as_deref() {
+        Ok("fused") => return Ok(false),
+        Ok("once") => return Ok(true),
+        _ => {}
+    }
+    Ok(statistic.evaluations_per_sample(c.plan.grid())? >= EVALUATE_ONCE_ABOVE)
+}
+
+/// Evaluate `samples` once per lattice point (`ops::lattice_samples`), then
+/// interpolate them at every voxel and hand `combine` the voxels of `sources`
+/// followed by the statistics. Three phases: the samples, whose blocks read
+/// only the window's own reach; a gather of the samples each block brackets,
+/// which reads no pixels; and the interpolation, which reads its sources
+/// voxelwise.
+fn sampled_phases(
+    c: &mut Cursor<'_>,
+    samples: LatticeSamplesOp,
+    name: &'static str,
+    sources: &[Image],
+    combine: SampleCombine,
+    output: Dtype,
+) -> Result<Image> {
+    let ids = sources.iter().map(|image| image.id).collect();
+    let phase = append_lattice_sample_phases(c.plan, samples, name, ids, combine, output)?;
+    c.wrote(phase)
+}
+
+/// A stream name unique within the plan: the phase the samples will be.
+fn stream_for(c: &Cursor<'_>, what: &str) -> String {
+    format!("{what}-{}", c.plan.n_phases())
 }
 
 /// Append one channel's binarisation, reading the raw channel `raw`.
@@ -410,33 +471,52 @@ pub fn append_binarize_phases(
                 population,
                 clip.bins,
             )?;
-            let background = statistic_percentile(
-                "lightsheet background",
-                StructuringElement::from_size_stepped(
-                    ElementShape::Box,
-                    arm.background,
-                    arm.background_step,
-                )?,
-                arm.background_spacing,
-                arm.percentile,
-                population,
+            let element = StructuringElement::from_size_stepped(
+                ElementShape::Box,
+                arm.background,
+                arm.background_step,
             )?;
             let versus = arm.versus;
-            // Written as `u16` directly: the answer is rounded, and the clipped
-            // range is the only range it can land in.
-            let correct = FnCombine::new("lightsheet correction", 3, move |x| {
+            let correct = move |x: &[f64]| {
                 let combined = x[1].min(versus * x[2]);
                 (x[0] - x[0].min(combined)).round()
-            })?
-            .producing(Dtype::U16)?;
-            Some(c.pixels(Chain::parallel(
-                vec![
-                    c.on(clipped, vec![]),
-                    c.on(clipped, vec![Chain::op(line)]),
-                    c.on_f64(clipped, vec![Chain::op(background)]),
-                ],
-                Box::new(correct),
-            )?)?)
+            };
+            let statistic = rank_statistic(element, arm.background_spacing, arm.percentile)?;
+            if !evaluate_once(c, &statistic)? {
+                let background = LocalStatisticOp::new("lightsheet background", statistic)
+                    .masked_by(population.id);
+                // Written as `u16` directly: the answer is rounded, and the
+                // clipped range is the only range it can land in.
+                let correct =
+                    FnCombine::new("lightsheet correction", 3, correct)?.producing(Dtype::U16)?;
+                Some(c.pixels(Chain::parallel(
+                    vec![
+                        c.on(clipped, vec![]),
+                        c.on(clipped, vec![Chain::op(line)]),
+                        c.on_f64(clipped, vec![Chain::op(background)]),
+                    ],
+                    Box::new(correct),
+                )?)?)
+            } else {
+                // The line is its own phase (`u16`, like the clip), so that the
+                // correction can read it voxelwise beside the background.
+                let line = c.pixels(c.on(clipped, vec![Chain::op(line)]))?;
+                let samples = LatticeSamplesOp::new(
+                    "lightsheet background",
+                    stream_for(c, "lightsheet-background"),
+                    clipped.id,
+                    vec![statistic],
+                )?
+                .masked_by(population.id);
+                Some(sampled_phases(
+                    c,
+                    samples,
+                    "lightsheet correction",
+                    &[clipped, line],
+                    Arc::new(correct),
+                    Dtype::U16,
+                )?)
+            }
         }
         _ => None,
     };
@@ -460,32 +540,41 @@ pub fn append_binarize_phases(
     let equalized = match (params.equalize, population) {
         (Some(arm), Some(population)) => {
             let element = StructuringElement::from_size(ElementShape::Box, arm.selem)?;
-            let low = statistic_percentile(
-                "equalize low",
-                element.clone(),
-                arm.spacing,
-                arm.percentile.0,
-                population,
-            )?;
-            let high = statistic_percentile(
-                "equalize high",
-                element,
-                arm.spacing,
-                arm.percentile.1,
-                population,
-            )?;
             let ceiling = arm.max_value;
-            let gain = FnCombine::new("equalize gain", 3, move |x| {
-                bounded_gain_value(x[0], x[1], x[2], EQUALIZE_FLOOR, ceiling)
-            })?;
-            Some(c.pixels(Chain::parallel(
-                vec![
-                    c.on_f64(filtered, vec![]),
-                    c.on_f64(filtered, vec![Chain::op(low)]),
-                    c.on_f64(filtered, vec![Chain::op(high)]),
-                ],
-                Box::new(gain),
-            )?)?)
+            let gain =
+                move |x: &[f64]| bounded_gain_value(x[0], x[1], x[2], EQUALIZE_FLOOR, ceiling);
+            let low = rank_statistic(element.clone(), arm.spacing, arm.percentile.0)?;
+            let high = rank_statistic(element, arm.spacing, arm.percentile.1)?;
+            if !evaluate_once(c, &low)? {
+                let low = LocalStatisticOp::new("equalize low", low).masked_by(population.id);
+                let high = LocalStatisticOp::new("equalize high", high).masked_by(population.id);
+                let gain = FnCombine::new("equalize gain", 3, gain)?;
+                Some(c.pixels(Chain::parallel(
+                    vec![
+                        c.on_f64(filtered, vec![]),
+                        c.on_f64(filtered, vec![Chain::op(low)]),
+                        c.on_f64(filtered, vec![Chain::op(high)]),
+                    ],
+                    Box::new(gain),
+                )?)?)
+            } else {
+                // Both percentiles from one gather of each window.
+                let samples = LatticeSamplesOp::new(
+                    "equalize percentiles",
+                    stream_for(c, "equalize"),
+                    filtered.id,
+                    vec![low, high],
+                )?
+                .masked_by(population.id);
+                Some(sampled_phases(
+                    c,
+                    samples,
+                    "equalize gain",
+                    &[filtered],
+                    Arc::new(gain),
+                    Dtype::F64,
+                )?)
+            }
         }
         _ => None,
     };
@@ -554,18 +643,42 @@ pub fn append_binarize_phases(
             Statistic::Isodata(Isodata::new(ISODATA_BINS, 0.0)?),
         )?;
         let volume = deconvolved.unwrap_or(filtered);
-        sink = c.pixels(Chain::parallel(
-            vec![
-                c.on(sink, vec![]),
-                c.on_f64(
-                    volume,
-                    vec![Chain::op(AdaptiveThresholdOp::new(
-                        "adaptive", statistic, 1.0, 0.0,
-                    ))],
-                ),
-            ],
-            or()?,
-        )?)?;
+        sink = if !evaluate_once(c, &statistic)? {
+            c.pixels(Chain::parallel(
+                vec![
+                    c.on(sink, vec![]),
+                    c.on_f64(
+                        volume,
+                        vec![Chain::op(AdaptiveThresholdOp::new(
+                            "adaptive", statistic, 1.0, 0.0,
+                        ))],
+                    ),
+                ],
+                or()?,
+            )?)?
+        } else {
+            // `AdaptiveThresholdOp` at a scale of one and an offset of zero,
+            // then OR-ed into the sink, in one voxelwise step: the level is
+            // written exactly as that op writes it.
+            let samples = LatticeSamplesOp::new(
+                "adaptive isodata",
+                stream_for(c, "adaptive"),
+                volume.id,
+                vec![statistic],
+            )?;
+            sampled_phases(
+                c,
+                samples,
+                "adaptive",
+                &[sink, volume],
+                Arc::new(|x: &[f64]| {
+                    let level = 1.0 * x[2] + 0.0;
+                    let above = if x[1] > level { 1.0 } else { 0.0 };
+                    from_set(is_set(x[0]) || is_set(above))
+                }),
+                Dtype::Bool,
+            )?
+        };
     }
 
     if let (Some(arm), Some(equalized)) = (params.equalize, equalized) {

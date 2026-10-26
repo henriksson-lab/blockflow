@@ -212,9 +212,10 @@ pub struct Machine {
     ///
     /// `false` — the default, and everything this simulator has ever modelled —
     /// dispatches continuously: a task starts the moment its own dependencies
-    /// are met, so phases overlap. `true` is what `strategy::execute` actually
-    /// does: it pops a wave, runs it, and **joins the whole wave** before the
-    /// next.
+    /// are met, so phases overlap. That is what `strategy::execute` does since
+    /// 2026-10-22 (a block is admitted as soon as one finishes and room
+    /// frees). `true` models the executor before that: it popped a wave, ran
+    /// it, and **joined the whole wave** before the next.
     ///
     /// # Why the difference is a field and not a detail
     ///

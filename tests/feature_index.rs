@@ -42,6 +42,107 @@ fn done<T>(x: Outcome<T>) -> T {
 fn binding() -> String {
     "a".repeat(64)
 }
+
+#[test]
+fn physical_anchor_checks_account_for_translated_world_roundoff() {
+    // Includes the actual human Blaze 6b working frame; its Y half-voxel
+    // coordinate previously exceeded the local-q-only floating-point bound.
+    let origin = [1428.036304347826, 8006.806983082706, 20.058823529411764];
+    let spacing = [39.41260869565217, 39.39396616541353, 40.11764705882353];
+    let q: f64 = ((origin[1] + 0.5 * spacing[1]) - origin[1]) / spacing[1];
+    assert!((q - 1.).abs() > 0.5 + 16. * f64::EPSILON * q.abs().max(1.));
+    for signs in 0..8 {
+        for allowance in [0., 0.5] {
+            let mut g = geometry();
+            g.origin_xyz =
+                std::array::from_fn(|i| origin[i] * if signs & (1 << i) == 0 { 1. } else { -1. });
+            g.spacing_xyz = spacing;
+            g.max_offset_voxels = allowance;
+            for displacement in [-allowance, 0., allowance] {
+                let path = dir("world-roundoff");
+                let memory = MemoryBudget::new(256 * 1024);
+                let mut writer =
+                    Writer::create(&path, g.clone(), binding(), 2, memory.clone()).unwrap();
+                let mut p = point(&g, 1, 1.);
+                let anchor = if displacement < 0. {
+                    4
+                } else if displacement > 0. {
+                    3
+                } else {
+                    1
+                };
+                p.at_zyx = [anchor; 3];
+                p.position_xyz = std::array::from_fn(|i| {
+                    g.origin_xyz[i] + (anchor as f64 + displacement) * g.spacing_xyz[i]
+                });
+                let mut b = Budget::new(Limits::default());
+                assert_eq!(
+                    done(
+                        writer
+                            .write_cell(g.cell_of(p.at_zyx).unwrap(), [p], &mut b)
+                            .unwrap()
+                    ),
+                    1
+                );
+                writer.finish().unwrap();
+                let reader = Reader::open(&path, &binding(), memory).unwrap();
+                for radius in [0.001, 1e-14] {
+                    let found = done(reader.neighbors(p.position_xyz, radius, 2, &mut b).unwrap());
+                    assert_eq!(found.points.len(), 1, "signs {signs}, allowance {allowance}, displacement {displacement}, radius {radius}");
+                    assert_eq!(found.points[0].feature, p);
+                }
+                std::fs::remove_dir_all(path).unwrap();
+            }
+            for axis in 0..3 {
+                for displacement in [-allowance - 1e-6, allowance + 1e-6] {
+                    let path = dir("bad-world-offset");
+                    let mut writer = Writer::create(
+                        &path,
+                        g.clone(),
+                        binding(),
+                        2,
+                        MemoryBudget::new(256 * 1024),
+                    )
+                    .unwrap();
+                    let mut p = point(&g, 1, 1.);
+                    p.position_xyz[axis] =
+                        g.origin_xyz[axis] + (1. + displacement) * g.spacing_xyz[axis];
+                    assert!(writer
+                        .write_cell([0, 0, 0], [p], &mut Budget::new(Limits::default()))
+                        .is_err());
+                    drop(writer);
+                    std::fs::remove_dir_all(path).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unresolved_world_coordinates_are_refused_instead_of_widening_offset_bounds() {
+    let mut g = geometry();
+    g.origin_xyz = [1e20, -1e20, 1e20];
+    g.spacing_xyz = [1., 1.5, 2.];
+    let path = dir("unresolved-world");
+    let mut writer = Writer::create(
+        &path,
+        g.clone(),
+        binding(),
+        2,
+        MemoryBudget::new(256 * 1024),
+    )
+    .unwrap();
+    let error = writer
+        .write_cell(
+            [0, 0, 0],
+            [point(&g, 1, 1.)],
+            &mut Budget::new(Limits::default()),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("lack subvoxel precision"));
+    drop(writer);
+    std::fs::remove_dir_all(path).unwrap();
+}
 fn build(path: &std::path::Path, g: Geometry, reverse: bool) -> Metadata {
     let mut writer =
         Writer::create(path, g.clone(), binding(), 2, MemoryBudget::new(256 * 1024)).unwrap();
@@ -476,4 +577,298 @@ fn partitioned_queries_filter_before_caps_and_charge_excluded_points() {
     assert_eq!(calls.get(), 0);
     assert_eq!(b.stats.work_units, 0);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn packed_build(root: &std::path::Path) -> (Metadata, Stats) {
+    let g = geometry();
+    let mut w = Writer::create_with_layout(
+        root,
+        g.clone(),
+        binding(),
+        2,
+        MemoryBudget::new(256 * 1024),
+        PageLayout::Packed,
+    )
+    .unwrap();
+    let mut b = Budget::new(Limits::default());
+    done(
+        w.write_cell(
+            [0, 0, 0],
+            [
+                point(&g, 2, 1.),
+                point(&g, 3, 3.),
+                point(&g, 2, 2.),
+                point(&g, 1, 1.),
+            ],
+            &mut b,
+        )
+        .unwrap(),
+    );
+    done(
+        w.write_cell([0, 0, 1], [point(&g, 6, 2.), point(&g, 5, 1.)], &mut b)
+            .unwrap(),
+    );
+    (w.finish().unwrap(), b.stats)
+}
+#[test]
+fn packed_payload_is_exact_legacy_pages_and_queries_preserve_keys_order_and_cursors() {
+    let legacy = dir("packed-legacy");
+    let packed = dir("packed-v2");
+    let a = build(&legacy, geometry(), false);
+    let (b, _) = packed_build(&packed);
+    let mut am = serde_json::to_value(a).unwrap();
+    let bm = serde_json::to_value(b).unwrap();
+    am["version"] = serde_json::json!(2);
+    assert_eq!(am, bm);
+    assert_eq!(
+        std::fs::read(legacy.join("cells.bin")).unwrap(),
+        std::fs::read(packed.join("cells.bin")).unwrap()
+    );
+    let offsets = std::fs::read(packed.join("page_offsets.bin")).unwrap();
+    let payload = std::fs::read(packed.join("pages.bin")).unwrap();
+    assert_eq!(offsets.len(), 32);
+    let mut end = 0;
+    for i in 0..2 {
+        let start = u64::from_le_bytes(offsets[i * 16..i * 16 + 8].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(offsets[i * 16 + 8..i * 16 + 16].try_into().unwrap()) as usize;
+        assert_eq!(start, end);
+        end = start + len;
+        assert_eq!(
+            &payload[start..end],
+            std::fs::read(legacy.join(format!("pages/0/0/{i}.rows"))).unwrap()
+        );
+    }
+    assert_eq!(end, payload.len());
+    for cache_bytes in [0, 64 * 1024] {
+        let mut readers = [&legacy, &packed].map(|p| {
+            Reader::open_cached(
+                p,
+                &binding(),
+                MemoryBudget::new(512 * 1024),
+                ReadCacheConfig {
+                    max_bytes: cache_bytes,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        });
+        let mut results = vec![];
+        for r in &mut readers {
+            let mut budget = Budget::new(Limits::default());
+            assert_eq!(done(r.next_cell(&mut budget).unwrap()), Some([0, 0, 0]));
+            let q = done(
+                r.neighbors(point(&geometry(), 3, 1.).position_xyz, 3., 3, &mut budget)
+                    .unwrap(),
+            );
+            let parts = done(
+                r.neighbors_by(
+                    point(&geometry(), 3, 1.).position_xyz,
+                    3.,
+                    2,
+                    1,
+                    |p, _| Some(((p.feature.at_zyx[2] >= 4) as usize, -p.feature.weight)),
+                    &mut budget,
+                )
+                .unwrap(),
+            );
+            assert_eq!(done(r.next_cell(&mut budget).unwrap()), Some([0, 0, 1]));
+            assert_eq!(done(r.next_cell(&mut budget).unwrap()), None);
+            if cache_bytes > 0 {
+                let mut warm = Budget::new(Limits {
+                    max_read_calls: 0,
+                    ..Default::default()
+                });
+                let repeated = done(
+                    r.neighbors(point(&geometry(), 3, 1.).position_xyz, 3., 3, &mut warm)
+                        .unwrap(),
+                );
+                assert_eq!(q.points, repeated.points);
+                assert_eq!(warm.stats.read_calls, 0);
+                assert!(r.cache_stats().resident_bytes <= cache_bytes);
+                r.clear_cache();
+                assert_eq!(r.cache_stats().resident_bytes, 0);
+            }
+            results.push((
+                q.points,
+                q.partition_counts,
+                q.matching_points,
+                q.truncated,
+                parts.points,
+                parts.partition_counts,
+            ));
+        }
+        assert_eq!(results[0], results[1]);
+    }
+    std::fs::remove_dir_all(legacy).unwrap();
+    std::fs::remove_dir_all(packed).unwrap();
+}
+#[test]
+fn packed_offsets_consume_explicit_read_credits_and_stop_before_page_decode() {
+    let legacy = dir("packed-ledger-legacy");
+    let packed = dir("packed-ledger");
+    build(&legacy, geometry(), false);
+    let (_, writes) = packed_build(&packed);
+    let mut ledgers = vec![];
+    for p in [&legacy, &packed] {
+        let r = Reader::open(p, &binding(), MemoryBudget::new(256 * 1024)).unwrap();
+        let mut b = Budget::new(Limits::default());
+        done(r.read_cell([0, 0, 0], &mut b).unwrap());
+        ledgers.push(b.stats);
+    }
+    assert_eq!(ledgers[1].read_calls, ledgers[0].read_calls + 1);
+    assert_eq!(
+        ledgers[1].charged_bytes_read,
+        ledgers[0].charged_bytes_read + 16
+    );
+    assert_eq!(ledgers[1].page_read_calls, ledgers[0].page_read_calls);
+    assert_eq!(ledgers[1].work_units, ledgers[0].work_units);
+    let expected_write = std::fs::metadata(packed.join("pages.bin")).unwrap().len() + 48 + 32;
+    assert_eq!(writes.charged_bytes_written, expected_write);
+    assert_eq!(writes.write_calls, 2);
+    for limits in [
+        Limits {
+            max_read_calls: 2,
+            ..Default::default()
+        },
+        Limits {
+            max_bytes_read: 63,
+            ..Default::default()
+        },
+    ] {
+        let r = Reader::open(&packed, &binding(), MemoryBudget::new(256 * 1024)).unwrap();
+        let mut b = Budget::new(limits);
+        assert!(matches!(
+            r.read_cell([0, 0, 0], &mut b).unwrap(),
+            Outcome::Stopped(_)
+        ));
+        assert_eq!(b.stats.page_decodes, 0);
+        assert_eq!(b.stats.page_read_calls, 0);
+    }
+    let memory = MemoryBudget::new(1);
+    let r = Reader::open(&packed, &binding(), memory.clone()).unwrap();
+    let mut b = Budget::new(Limits::default());
+    assert!(matches!(
+        r.read_cell([0, 0, 0], &mut b).unwrap(),
+        Outcome::Stopped(Stop::Memory)
+    ));
+    assert_eq!(b.stats.page_decodes, 0);
+    assert_eq!(memory.high_water(), 0);
+    std::fs::remove_dir_all(legacy).unwrap();
+    std::fs::remove_dir_all(packed).unwrap();
+}
+#[test]
+fn packed_partial_budgeted_and_failed_publication_remain_unsealed() {
+    for kind in 0..3 {
+        let p = dir("packed-unsealed");
+        let g = geometry();
+        let memory = MemoryBudget::new(256 * 1024);
+        let mut w = Writer::create_with_layout(
+            &p,
+            g.clone(),
+            binding(),
+            2,
+            memory.clone(),
+            PageLayout::Packed,
+        )
+        .unwrap();
+        assert!(Reader::open(&p, &binding(), memory.clone()).is_err());
+        if kind == 0 {
+            drop(w);
+        } else if kind == 1 {
+            let mut b = Budget::new(Limits {
+                max_bytes_written: 1,
+                ..Default::default()
+            });
+            assert!(matches!(
+                w.write_cell([0, 0, 0], [point(&g, 1, 1.)], &mut b).unwrap(),
+                Outcome::Stopped(_)
+            ));
+            assert!(w.finish().is_err());
+            assert_eq!(std::fs::metadata(p.join("pages.bin")).unwrap().len(), 0);
+        } else {
+            done(
+                w.write_cell(
+                    [0, 0, 0],
+                    [point(&g, 1, 1.)],
+                    &mut Budget::new(Limits::default()),
+                )
+                .unwrap(),
+            );
+            std::fs::write(p.join("manifest.partial"), b"publication blocked").unwrap();
+            assert!(w.finish().is_err());
+        }
+        assert!(Reader::open(&p, &binding(), memory).is_err());
+        std::fs::remove_dir_all(p).unwrap();
+    }
+    let p = dir("packed-empty");
+    let m = MemoryBudget::new(256 * 1024);
+    Writer::create_with_layout(&p, geometry(), binding(), 2, m.clone(), PageLayout::Packed)
+        .unwrap()
+        .finish()
+        .unwrap();
+    let mut r = Reader::open(&p, &binding(), m).unwrap();
+    assert_eq!(
+        done(r.next_cell(&mut Budget::new(Limits::default())).unwrap()),
+        None
+    );
+    std::fs::remove_dir_all(p).unwrap();
+}
+#[test]
+fn packed_corrupt_ranges_truncation_and_wrong_cell_pages_are_errors() {
+    for kind in 0..7 {
+        let p = dir("packed-corrupt");
+        packed_build(&p);
+        match kind {
+            0 => {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p.join("page_offsets.bin"))
+                    .unwrap()
+                    .set_len(31)
+                    .unwrap();
+            }
+            1 => {
+                std::fs::remove_file(p.join("pages.bin")).unwrap();
+            }
+            2 => {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(p.join("pages.bin"))
+                    .unwrap()
+                    .set_len(1)
+                    .unwrap();
+            }
+            3 | 4 => {
+                let mut data = std::fs::read(p.join("page_offsets.bin")).unwrap();
+                data[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+                if kind == 4 {
+                    data[8..16].copy_from_slice(&0u64.to_le_bytes());
+                }
+                std::fs::write(p.join("page_offsets.bin"), data).unwrap();
+            }
+            5 => {
+                let mut data = std::fs::read(p.join("page_offsets.bin")).unwrap();
+                let first = data[..16].to_vec();
+                data[16..].copy_from_slice(&first);
+                std::fs::write(p.join("page_offsets.bin"), data).unwrap();
+            }
+            _ => {
+                let mut data = std::fs::read(p.join("pages.bin")).unwrap();
+                data[0] ^= 255;
+                std::fs::write(p.join("pages.bin"), data).unwrap();
+            }
+        }
+        match Reader::open(&p, &binding(), MemoryBudget::new(256 * 1024)) {
+            Err(_) => assert!(kind <= 1),
+            Ok(r) => assert!(
+                r.read_cell(
+                    if kind == 5 { [0, 0, 1] } else { [0, 0, 0] },
+                    &mut Budget::new(Limits::default())
+                )
+                .is_err(),
+                "kind {kind}"
+            ),
+        }
+        std::fs::remove_dir_all(p).unwrap();
+    }
 }

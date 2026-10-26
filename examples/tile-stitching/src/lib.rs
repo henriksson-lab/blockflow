@@ -26,11 +26,16 @@
 //! [2, 1]`) and wobble along z (`wobble_axis = 0`) by default; every module
 //! takes the axes as parameters.
 //!
-//! Alignment is resident: the rigid step reads a `depth`-thick slab at each
-//! facing end, the per-slice step reads the overlap cuts, and each tile is
-//! held in memory while it runs. Fusion at stored positions is planned
+//! Alignment reads boxes (`tiles`): the rigid step a `depth`-thick slab at
+//! each facing end, the per-slice step the overlap cuts. From stored tiles
+//! ([`align_stored`]) only the boxes of the pairs in flight are held, and the
+//! pairs in flight are as many as the memory cap leaves room for; where a
+//! pair's slabs and cuts share stored chunks, the rigid step reads both as one
+//! and keeps the cuts, leased, for the per-slice step. Fusion is planned
 //! (`planned`): slab by slab, reading only the tile boxes each slab needs, and
-//! written slab by slab into the pyramid (`pyramid`).
+//! written slab by slab into core's multiscale writer (`pyramid`). Resident
+//! tiles ([`align`], [`stitch`], [`fuse::resident`]) go through the same
+//! boxes, as views.
 
 pub mod fuse;
 pub mod io;
@@ -43,6 +48,7 @@ pub mod relayout;
 pub mod rigid;
 pub mod solve;
 pub mod tile_dir;
+pub mod tiles;
 pub mod wobbly;
 
 use blockflow::error::{Error, Result};
@@ -53,6 +59,7 @@ use crate::fuse::{FuseParams, Placement};
 use crate::layout::{RigidPlacementParams, TileLayout};
 use crate::place::{PlaceParams, PlacedLayout, WobblyLayout};
 use crate::rigid::RigidParams;
+use crate::tiles::{StoredTiles, TileBoxes};
 use crate::wobbly::MeasureParams;
 
 /// Every parameter of the chain.
@@ -175,7 +182,7 @@ pub struct Aligned {
 
 /// The chain up to the placement: rigid, then (unless `params.wobbly` is off)
 /// per-slice measurement and placement.
-pub fn align(tiles: &[Voxels], mut layout: TileLayout, params: &StitchParams) -> Result<Aligned> {
+pub fn align(tiles: &[Voxels], layout: TileLayout, params: &StitchParams) -> Result<Aligned> {
     if tiles.len() != layout.sources().len() {
         return Err(Error::invalid(format!(
             "the layout has {} tiles and {} volumes were given",
@@ -192,10 +199,91 @@ pub fn align(tiles: &[Voxels], mut layout: TileLayout, params: &StitchParams) ->
             )));
         }
     }
-    align_rigid(tiles, &mut layout, params)?;
-    let shapes = tiles.iter().map(Voxels::shape).collect::<Vec<_>>();
-    let (wobbly, placed, placement) = if params.wobbly && !layout.alignments().is_empty() {
-        let wobbly = measure_wobbly(tiles, &layout, params)?;
+    struct Align<'a> {
+        layout: TileLayout,
+        params: &'a StitchParams,
+    }
+    impl TileVisitor for Align<'_> {
+        type Out = Aligned;
+        fn visit<T: VoxelElement>(self, views: &[ArrayView3<'_, T>]) -> Result<Aligned> {
+            align_boxes(views, self.layout, self.params)
+        }
+    }
+    visit_tiles(tiles, Align { layout, params })
+}
+
+/// [`align`], reading only the boxes each pair needs from the stored tiles:
+/// no tile is held whole, and the pairs in flight are as many as the memory
+/// cap leaves room for.
+pub fn align_stored(
+    tiles: &StoredTiles,
+    layout: TileLayout,
+    params: &StitchParams,
+) -> Result<Aligned> {
+    if tiles.sources.len() != layout.sources().len() {
+        return Err(Error::invalid(format!(
+            "the layout has {} tiles and {} were given",
+            layout.sources().len(),
+            tiles.sources.len()
+        )));
+    }
+    for (index, (shape, source)) in tiles.shapes.iter().zip(layout.sources()).enumerate() {
+        if *shape != source.shape {
+            return Err(Error::invalid(format!(
+                "tile {index} is {shape:?} and the layout says {:?}",
+                source.shape
+            )));
+        }
+    }
+    blockflow::dtype_dispatch!(
+        tiles.dtype,
+        |Element| align_boxes::<Element, _>(tiles, layout, params),
+        f16 => Err(Error::invalid("float16 tiles are not supported"))
+    )
+}
+
+/// The chain up to the placement over any source of tile boxes.
+fn align_boxes<T: VoxelElement, B: TileBoxes<T> + ?Sized>(
+    tiles: &B,
+    mut layout: TileLayout,
+    params: &StitchParams,
+) -> Result<Aligned> {
+    let shapes = (0..tiles.len())
+        .map(|tile| tiles.shape(tile))
+        .collect::<Vec<_>>();
+    let pairs = layout
+        .alignments()
+        .iter()
+        .map(|alignment| (alignment.pre, alignment.post))
+        .collect::<Vec<_>>();
+    let measured = params.wobbly && !pairs.is_empty();
+    // The per-slice step cuts much of what the rigid step reads (all of it,
+    // for narrow tiles), so the rigid step reads ahead the boxes the cuts will
+    // take once the rigid positions are placed, wherever that decodes less
+    // than reading the two apart.
+    let ahead = if measured {
+        wobbly::cut_boxes_within(
+            layout.positions(),
+            &pairs,
+            &shapes,
+            params.wobble_axis,
+            &params.measure,
+            &read_ahead_margins(&layout, &params.rigid),
+        )
+    } else {
+        Vec::new()
+    };
+    let kept = rigid::align_layout_keeping(&mut layout, tiles, &params.rigid, &ahead)?;
+    layout.place_in_place(&params.rigid_placement)?;
+    let (wobbly, placed, placement) = if measured {
+        let wobbly = wobbly::measure_layout_kept(
+            layout.positions(),
+            &pairs,
+            tiles,
+            params.wobble_axis,
+            &params.measure,
+            kept,
+        )?;
         let placed = place::place_layout(&wobbly, &params.place)?;
         let placement = Placement::from_placed(&placed, &shapes, params.wobble_axis)?;
         (Some(wobbly), Some(placed), placement)
@@ -209,6 +297,28 @@ pub fn align(tiles: &[Voxels], mut layout: TileLayout, params: &StitchParams) ->
         placed,
         placement,
     })
+}
+
+/// How far each pair's position difference may move between the nominal and
+/// the rigidly placed layout, for reading its cuts ahead: on the two axes the
+/// rigid step corrects, its search range; on the tiling axis, which it leaves
+/// alone, none; and on every axis a few voxels for what the placement's least
+/// squares spread. A pair that moves further has its cuts read again.
+fn read_ahead_margins(layout: &TileLayout, params: &RigidParams) -> Vec<[(isize, isize); 3]> {
+    const SPREAD: isize = 2;
+    (0..layout.alignments().len())
+        .map(|index| {
+            let tiling = layout.tiling_axis(index);
+            std::array::from_fn(|axis| {
+                let (low, high) = if tiling == Some(axis) {
+                    (0, 0)
+                } else {
+                    params.max_shifts[axis]
+                };
+                (low - SPREAD, high + SPREAD)
+            })
+        })
+        .collect()
 }
 
 /// The whole chain, from tiles and a nominal layout to the fused volume.

@@ -45,8 +45,11 @@ pub mod radius;
 pub mod raw;
 pub mod reduce;
 pub mod signal;
+pub(crate) mod store;
 pub mod tables;
 pub mod vessel;
+
+use std::sync::Arc;
 
 use blockflow::error::{Error, Result};
 use blockflow::voxels::Voxels;
@@ -57,12 +60,14 @@ pub use annotate::annotate;
 pub use branch::{branch_density, BranchParams, Selection};
 pub use classify::{classify, ClassifyParams, ClassifyTrace};
 pub use clean::{clean, CleanGraph, CleanParams};
-pub use columns::{Aggregate, Column, EdgeFold};
+pub use columns::{Aggregate, Column, EdgeFold, RawColumn};
 pub use component::{largest_component, Component};
-pub use radius::{radii, RadiusMeasurement, RadiusParams, RadiusSearch};
+pub use radius::{carried_radii, radii, RadiusMeasurement, RadiusParams, RadiusSearch};
 pub use raw::{build, build_blocked, BuildParams, Csr, RawGraph};
 pub use reduce::{reduce, ReduceParams, ReducedGraph};
-pub use tables::{write_graph_tables, GraphTables, TableGeometry};
+pub use tables::{
+    write_graph_tables, write_graph_tables_within, GraphTables, TableGeometry, TableMemory,
+};
 pub use vessel::{Affine, Carried, Lattice, PointMap, VesselGraph};
 
 /// The volumes a graph is measured from. Only the skeleton is required; all
@@ -152,12 +157,13 @@ pub fn vessel_graph(inputs: &Inputs<'_>, params: &GraphParams) -> Result<VesselG
     GRAPH.stage("radii");
     let axial_um = match inputs.vessels {
         Some(vessels) => {
-            let measured = radii(vessels, points, inputs.spacing, &params.radius)?;
-            let axial = measured.radius_units_axial.clone();
-            for (name, column) in measured.columns() {
-                carried.push(Carried::max(name, column));
-            }
-            axial
+            let search = Arc::new(RadiusSearch::new(params.radius.clone())?);
+            let stops = search.stops(vessels, points)?;
+            carried.extend(carried_radii(Arc::clone(&search), &stops, inputs.spacing)?);
+            stops
+                .iter()
+                .map(|stop| search.units_axial(*stop, inputs.spacing))
+                .collect()
         }
         None => vec![[0.0; 3]; points.len()],
     };
@@ -187,24 +193,29 @@ pub fn vessel_graph(inputs: &Inputs<'_>, params: &GraphParams) -> Result<VesselG
         }
     }
 
-    finish(&raw, &carried, params, inputs.spacing)
+    finish(raw, carried, params, inputs.spacing)
 }
 
 /// Stages 4–6 from a raw graph and the columns carried on it: clean, reduce,
-/// assemble, the largest component (if asked) and the edge lengths.
+/// assemble, the largest component (if asked) and the edge lengths. Each
+/// structure is let go as soon as the next stage no longer needs it; the
+/// graph keeps the raw coordinates and columns its carried columns read.
 pub fn finish(
-    raw: &RawGraph,
-    carried: &[Carried],
+    mut raw: RawGraph,
+    carried: Vec<Carried>,
     params: &GraphParams,
     spacing: [f64; 3],
 ) -> Result<VesselGraph> {
     GRAPH.stage("clean");
-    let cleaned = clean(raw, &params.clean)?;
+    let mut cleaned = clean(&raw, &params.clean)?;
+    raw.drop_edges();
     // The polylines are what every edge column is folded over.
     GRAPH.stage("reduce");
     let reduced = reduce(&cleaned, &ReduceParams::default())?;
+    cleaned.drop_edges();
     GRAPH.stage("assemble");
-    let graph = VesselGraph::assemble(raw, &cleaned, &reduced, carried)?;
+    let graph = VesselGraph::assemble(&raw, &cleaned, &reduced, &carried)?;
+    drop((raw, cleaned, reduced, carried));
     GRAPH.stage("largest component, lengths");
     let mut graph = match params.largest_component {
         true => graph.largest_component()?,
@@ -222,7 +233,7 @@ pub fn vessel_graph_stored(
     plan: &planned::PlanParams,
 ) -> Result<VesselGraph> {
     GRAPH.stage("build and measure (planned)");
-    let (raw, carried) = planned::measure_stored(inputs, params, &params.build, plan)?;
+    let (raw, carried, lease) = planned::measure_stored(inputs, params, &params.build, plan)?;
     if crate::profile::enabled() {
         eprintln!(
             "profile graph: raw graph of {} vertices and {} edges",
@@ -230,5 +241,9 @@ pub fn vessel_graph_stored(
             raw.n_edges()
         );
     }
-    finish(&raw, &carried, params, inputs.spacing)
+    let mut graph = finish(raw, carried, params, inputs.spacing)?;
+    if let Some(lease) = lease {
+        graph.hold(lease);
+    }
+    Ok(graph)
 }

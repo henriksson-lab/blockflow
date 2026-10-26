@@ -35,6 +35,7 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -48,11 +49,14 @@ CLEARMAP_ROOT = Path(os.environ.get("CLEARMAP_ROOT", "/data/henriksson/github/cl
 ALIGNMENT = CLEARMAP_ROOT / "ClearMap" / "Resources" / "Alignment"
 SIDES = ("clearmap", "ours")
 THREAD_VARIABLES = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
-                    "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS", "RAYON_NUM_THREADS")
+                    "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS", "RAYON_NUM_THREADS",
+                    # ITK's thread pool (elastix, transformix): `-threads N` alone leaves the pool at
+                    # all cores, whose idle workers spin (6 threads asked: 21 cores of CPU time).
+                    "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS")
 CSV_COLUMNS = ["run_id", "workload", "size", "side", "repeat", "position", "threads", "variant", "exit",
                "wall_s", "user_s", "sys_s", "cpu_s", "tree_rss_peak_gb", "tree_pss_peak_gb",
                "tree_anon_peak_gb", "max_rss_single_gb", "processes_peak", "load1_before", "load1_after",
-               "load1_max", "other_cores_mean", "over_max_load", "cache", "started",
+               "load1_max", "other_cores_mean", "busy_cores_before", "over_max_load", "cache", "started",
                "blockflow_commit", "blockflow_dirty", "clearmap_commit", "out"]
 
 
@@ -151,6 +155,22 @@ def meminfo():
 def loadavg():
     with open("/proc/loadavg") as f:
         return [float(v) for v in f.read().split()[:3]]
+
+
+def busy_cores(seconds=5.0):
+    """Cores busy over the next `seconds`, from /proc/stat. Unlike the load
+    average, which takes minutes to decay after a run, this says at once
+    whether the machine is idle."""
+    def sample():
+        with open("/proc/stat") as f:
+            fields = [int(v) for v in f.readline().split()[1:]]
+        idle = fields[3] + fields[4]  # idle + iowait
+        return sum(fields[:8]) - idle, sum(fields[:8])
+    busy0, total0 = sample()
+    time.sleep(seconds)
+    busy1, total1 = sample()
+    cores = os.cpu_count() or 1
+    return round(cores * (busy1 - busy0) / max(total1 - total0, 1), 2)
 
 
 def filesystem(path):
@@ -602,11 +622,13 @@ class Vessels(Workload):
                 command.append("--deep-fill")
                 if ctx.deep_fill_eval:
                     command.append("--eval")
+                if ctx.deep_fill_gpu:
+                    command += ["--device", "cuda"]
             return command
         command = ["bash", str(HERE / "ours" / "vessels.sh"), str(ctx.bin), str(out / "image.ome.zarr"),
                    str(out), str(ctx.threads)]
         if self.deep_fill:
-            command.append(str(ctx.weights))
+            command += [str(ctx.weights), "gpu" if ctx.deep_fill_gpu else "cpu"]
         return command
 
     def check(self, ctx, size, run_dir):
@@ -624,12 +646,13 @@ class Vessels(Workload):
 
 class VesselsDeepFill(Vessels):
     name = "vessels-deepfill"
-    description = Vessels.description + ", with the deep vessel filling (CNN) per channel, on the CPU"
+    description = Vessels.description + ", with the deep vessel filling (CNN) per channel (CPU; GPU with --deep-fill-gpu)"
     deep_fill = True
     expected = {"smoke": "~1.5-2.5 min per side", "region": "~4-10 min per side"}
     differences = Vessels.differences + [
-        "Deep filling on the CPU on both sides (blockflow has no GPU path yet; the reference's orchestrator "
-        "would use CUDA). torch gets --threads via torch.set_num_threads.",
+        "Deep filling on the CPU on both sides by default; --deep-fill-gpu runs it on the GPU on both sides "
+        "(torch CUDA float16, as the reference's orchestrator; blockflow's deep-fill-cuda build, float32). "
+        "torch gets --threads via torch.set_num_threads.",
         "The reference runs its network with dropout active (it never calls eval(); nondeterministic, about "
         "50% more filled voxels); --deep-fill-eval switches it off. blockflow is the network in evaluation "
         "mode.",
@@ -772,6 +795,7 @@ class EndToEnd(Workload):
             for sample in out.glob("osf-*"):
                 rmtree(sample / "stitch" / "fused.ome.zarr")
                 rmtree(sample / "cells" / "region.ome.zarr")
+                rmtree(sample / "cells" / "density.ome.zarr")
 
 
 def run_check(ctx, kind, run_dir, python):
@@ -803,6 +827,7 @@ class Context:
         self.variant = getattr(args, "variant", "corrected")
         self.weights = Path(getattr(args, "weights", "") or "")
         self.deep_fill_eval = getattr(args, "deep_fill_eval", False)
+        self.deep_fill_gpu = getattr(args, "deep_fill_gpu", False)
 
 
 def selection(args):
@@ -826,17 +851,27 @@ def thread_environment(n):
 
 
 def wait_for_load(args):
-    """Wait (up to --wait-max-s) for the 1-minute load to drop to --max-load."""
+    """Wait (up to --wait-max-s) for the busy cores to drop to --max-load.
+    Returns the seconds waited and the busy cores measured last."""
     waited = 0.0
     if not args.max_load:
-        return waited
-    while loadavg()[0] > args.max_load and waited < args.wait_max_s:
-        time.sleep(10)
+        return waited, None
+    busy = busy_cores()
+    while busy > args.max_load and waited < args.wait_max_s:
+        time.sleep(5)
         waited += 10
-    if loadavg()[0] > args.max_load:
-        print(f"   warning: load {loadavg()[0]:.1f} > --max-load {args.max_load}; running anyway "
+        busy = busy_cores()
+    if busy > args.max_load:
+        print(f"   warning: {busy:.1f} cores busy > --max-load {args.max_load}; running anyway "
               f"(the row is flagged)", flush=True)
-    return waited
+    return waited, busy
+
+
+def loaded_before(row):
+    """How busy the machine was at a run's start: the busy cores when they were
+    measured, else (older rows) the 1-minute load."""
+    busy = row.get("busy_cores_before")
+    return busy if busy is not None else (row.get("load1_before") or 0)
 
 
 def append_row(results, row):
@@ -858,6 +893,8 @@ def run_side(ctx, args, prov, workload, size, side, run_dir, repeat, position, c
         sys.exit(f"bench.py: {out} exists; outputs go to fresh directories")
     out.mkdir(parents=True)
     workload.setup(ctx, size, side, out)
+    # Wait for the load first, so the page cache is warmed right before the run.
+    waited, busy_before = wait_for_load(args)
     warm = {"mode": args.warm}
     inputs = workload.inputs(ctx, size, side)
     input_bytes = sum(p.stat().st_size for p in files_under(inputs))
@@ -873,7 +910,6 @@ def run_side(ctx, args, prov, workload, size, side, run_dir, repeat, position, c
         warm["state"] = "partial (inputs exceed half the available memory)"
     else:
         warm["state"] = "warm" if args.warm == "read" else cache_note
-    waited = wait_for_load(args)
     command = workload.command(ctx, size, side, out)
     if args.cpus:
         command = ["taskset", "-c", args.cpus] + command
@@ -908,14 +944,25 @@ def run_side(ctx, args, prov, workload, size, side, run_dir, repeat, position, c
         "load1_before": (m.get("load_before") or [None])[0], "load1_after": (m.get("load_after") or [None])[0],
         "load_before": m.get("load_before"), "load_after": m.get("load_after"),
         "max_load": args.max_load, "waited_for_load_s": waited,
-        "over_max_load": bool(args.max_load and (m.get("load_before") or [0])[0] > args.max_load),
+        "busy_cores_before": busy_before,
+        "over_max_load": bool(args.max_load and loaded_before({"busy_cores_before": busy_before,
+                                                               "load1_before": (m.get("load_before") or [0])[0]})
+                              > args.max_load),
         "cache": warm["state"], "warm_up": warm, "pinning": args.cpus,
         "thread_environment": thread_environment(ctx.threads), "extra_environment": workload.environment(ctx, size, side, out),
-        "command": command, "out": str(out), "side_timing": workload.side_timing(out, side),
+        "command": command, "out": str(out), "side_timing": safe_side_timing(workload, out, side),
         "blockflow_commit": prov["blockflow"]["commit"], "blockflow_dirty": prov["blockflow"]["dirty_paths"],
         "clearmap_commit": prov["clearmap"]["commit"], "provenance": prov,
     }
     return row
+
+
+def safe_side_timing(workload, out, side):
+    """The side's own per-step times; a missing or unreadable file is recorded, not fatal."""
+    try:
+        return workload.side_timing(out, side)
+    except Exception as error:  # noqa: BLE001
+        return {"error": f"{type(error).__name__}: {error}"}
 
 
 def cmd_run(args):
@@ -923,45 +970,66 @@ def cmd_run(args):
     chosen = selection(args)
     if args.build:
         for package, extra in (("blockflow-tile-stitching", []), ("blockflow-atlas-registration", []),
-                               ("blockflow-cell-density", []), ("blockflow-vessel-graph", ["--features", "deep-fill"])):
+                               ("blockflow-cell-density", []), ("blockflow-vessel-graph",
+                                ["--features", "deep-fill-cuda" if ctx.deep_fill_gpu else "deep-fill"])):
             subprocess.run(["cargo", "build", "--release", "-p", package] + extra, cwd=ROOT, check=True)
     results = Path(args.results or (ctx.root / "results"))
     prov = provenance(args)
     (results).mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     sides = [s for s in SIDES if s in args.sides.split(",")]
+    failures = []
     for workload, size in chosen:
         print(f"## {workload.name}:{size} — {workload.description}", flush=True)
-        workload.prepare(ctx, size)
-        base = ctx.root / "work" / workload.name / size
-        cache_note = "page cache as left by earlier runs"
-        if args.warm == "run":
-            for side in sides:
-                run_side(ctx, args, prov, workload, size, side, base / f"{stamp}-warmup", -1, -1, "", measured=False)
-                workload.cleanup(ctx, size, side, base / f"{stamp}-warmup" / side)
-            cache_note = "warm (discarded warm-up run)"
-        for repeat in range(args.repeats):
-            order = sides if repeat % 2 == 0 else sides[::-1]
-            run_dir = base / f"{stamp}-r{repeat}"
-            run_dir.mkdir(parents=True, exist_ok=True)
-            rows = []
-            for position, side in enumerate(order):
-                row = run_side(ctx, args, prov, workload, size, side, run_dir, repeat, position, cache_note)
-                rows.append(row)
-                append_row(results, row)
-            if args.check and len(sides) == 2 and all(r["exit"] == 0 for r in rows):
-                t0 = time.time()
-                check = workload.check(ctx, size, run_dir)
-                record = {"run_ids": [r["run_id"] for r in rows], "workload": workload.name, "size": size,
-                          "repeat": repeat, "seconds": round(time.time() - t0, 1), "result": check}
-                (run_dir / "check.json").write_text(json.dumps(record, indent=1))
-                with open(results / "checks.jsonl", "a") as f:
-                    f.write(json.dumps(record) + "\n")
-                print(f"   check: {json.dumps(check)[:600]}", flush=True)
-            if not args.keep and repeat < args.repeats - 1:
-                for side in sides:
-                    workload.cleanup(ctx, size, side, run_dir / side)
+        try:
+            run_workload(ctx, args, prov, results, stamp, sides, workload, size)
+        except Exception as error:  # noqa: BLE001 - one workload's failure must not end the campaign
+            detail = traceback.format_exc()
+            print(f"   {workload.name}:{size} ABORTED: {type(error).__name__}: {error}\n{detail}", flush=True)
+            failures.append(f"{workload.name}:{size}")
+            with open(results / "failures.jsonl", "a") as f:
+                f.write(json.dumps({"workload": workload.name, "size": size, "stamp": stamp,
+                                    "error": f"{type(error).__name__}: {error}", "traceback": detail[-4000:]})
+                        + "\n")
     cmd_summarize(args)
+    if failures:
+        print(f"bench.py: aborted workloads (see {results / 'failures.jsonl'}): {', '.join(failures)}", flush=True)
+
+
+def run_workload(ctx, args, prov, results, stamp, sides, workload, size):
+    """Prepare one workload, its warm-up runs, its alternated repeats and checks."""
+    workload.prepare(ctx, size)
+    base = ctx.root / "work" / workload.name / size
+    cache_note = "page cache as left by earlier runs"
+    if args.warm == "run":
+        for side in sides:
+            run_side(ctx, args, prov, workload, size, side, base / f"{stamp}-warmup", -1, -1, "", measured=False)
+            workload.cleanup(ctx, size, side, base / f"{stamp}-warmup" / side)
+        cache_note = "warm (discarded warm-up run)"
+    for repeat in range(args.repeats):
+        order = sides if repeat % 2 == 0 else sides[::-1]
+        run_dir = base / f"{stamp}-r{repeat}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for position, side in enumerate(order):
+            row = run_side(ctx, args, prov, workload, size, side, run_dir, repeat, position, cache_note)
+            rows.append(row)
+            append_row(results, row)
+        if args.check and len(sides) == 2 and all(r["exit"] == 0 for r in rows):
+            t0 = time.time()
+            try:
+                check = workload.check(ctx, size, run_dir)
+            except Exception as error:  # noqa: BLE001 - a broken check must not end the campaign
+                check = {"error": f"{type(error).__name__}: {error}", "traceback": traceback.format_exc()[-2000:]}
+            record = {"run_ids": [r["run_id"] for r in rows], "workload": workload.name, "size": size,
+                      "repeat": repeat, "seconds": round(time.time() - t0, 1), "result": check}
+            (run_dir / "check.json").write_text(json.dumps(record, indent=1))
+            with open(results / "checks.jsonl", "a") as f:
+                f.write(json.dumps(record) + "\n")
+            print(f"   check: {json.dumps(check)[:600]}", flush=True)
+        if not args.keep and repeat < args.repeats - 1:
+            for side in sides:
+                workload.cleanup(ctx, size, side, run_dir / side)
 
 
 def cmd_prepare(args):
@@ -1002,7 +1070,7 @@ def cmd_summarize(args):
     for row in rows:
         if args.workloads and row["workload"] not in [w.partition(":")[0] for w in args.workloads]:
             continue
-        loaded = bool(threshold and (row.get("load1_before") or 0) > threshold)
+        loaded = bool(threshold and loaded_before(row) > threshold)
         if loaded and args.exclude_loaded:
             continue
         key = (row["workload"], row["size"], row["threads"])
@@ -1010,7 +1078,7 @@ def cmd_summarize(args):
     lines = [f"Runs in {path}; load threshold {threshold or 'none'}"
              + (" (runs above it excluded)" if args.exclude_loaded else " (* = runs above it)"), "",
              "| workload | size | threads | side | n ok | wall s median [min-max] | CPU s median | "
-             "tree RSS GB | tree PSS GB | max single RSS GB | load1 before | loaded |",
+             "tree RSS GB | tree PSS GB | max single RSS GB | busy cores before | loaded |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     summary = []
     for (workload, size, threads), sides in sorted(groups.items()):
@@ -1020,6 +1088,7 @@ def cmd_summarize(args):
             ok = [r for r in runs if r.get("exit") == 0]
             stats = {k: spread([r.get(k) for r in ok]) for k in
                      ("wall_s", "cpu_s", "tree_rss_peak_gb", "tree_pss_peak_gb", "max_rss_single_gb", "load1_before")}
+            stats["busy_before"] = spread([loaded_before(r) for r in ok])
             stats["failed"] = len(runs) - len(ok)
             stats["loaded"] = sum(r["_loaded"] for r in runs)
             entry["sides"][side] = stats
@@ -1033,7 +1102,7 @@ def cmd_summarize(args):
                          f"{' (+%d failed)' % stats['failed'] if stats['failed'] else ''} | "
                          f"{w['median'] if w else '-'} [{w['min'] if w else '-'}-{w['max'] if w else '-'}] | "
                          f"{med('cpu_s')} | {med('tree_rss_peak_gb')} | {med('tree_pss_peak_gb')} | "
-                         f"{med('max_rss_single_gb')} | {med('load1_before')} | "
+                         f"{med('max_rss_single_gb')} | {med('busy_before')} | "
                          f"{'*' * stats['loaded'] if stats['loaded'] else ''} |")
         a, b = entry["sides"].get("clearmap"), entry["sides"].get("ours")
         ratios = {}
@@ -1082,10 +1151,14 @@ def main():
                         help="the reference's stitching defects corrected (see clearmap/stitch.py)")
     parser.add_argument("--deep-fill-eval", action="store_true",
                         help="run the reference's vessel-filling network in eval mode (dropout off)")
+    parser.add_argument("--deep-fill-gpu", action="store_true",
+                        help="vessels-deepfill: the deep filling on the GPU on both sides (torch CUDA, "
+                             "float16, as the reference's orchestrator; blockflow built with deep-fill-cuda)")
     parser.add_argument("--max-load", type=float, default=0.0,
-                        help="flag runs whose 1-minute load before the start exceeds this (0: no threshold)")
+                        help="flag runs that start with more than this many cores busy, measured from /proc/stat "
+                             "over 5 s (rows from before 2026-10-23: the 1-minute load) (0: no threshold)")
     parser.add_argument("--wait-max-s", type=float, default=0.0,
-                        help="wait up to this long for the load to drop below --max-load before each run")
+                        help="wait up to this long for the busy cores to drop below --max-load before each run")
     parser.add_argument("--exclude-loaded", action="store_true", help="summarize: leave flagged runs out")
     parser.add_argument("--warm", choices=["read", "run", "none"], default="read",
                         help="page cache: read each side's inputs before its run (default), one discarded "
@@ -1105,7 +1178,8 @@ def main():
                         help="a Python with numpy, zarr 3, pandas, scipy")
     parser.add_argument("--clearmap-py", default="/home/mahogny/miniconda3/envs/clearmap-gt2/bin/python")
     parser.add_argument("--weights", default=str(REFERENCE / "vessel-filling" / "cnn_binary_vessel_filling.safetensors"))
-    args = parser.parse_args()
+    # Intermixed: workloads may follow options (`run --build stitch-sa3x8:harness ... --threads 40`).
+    args = parser.parse_intermixed_args()
     {"list": cmd_list, "prepare": cmd_prepare, "run": cmd_run, "summarize": cmd_summarize}[args.command](args)
 
 

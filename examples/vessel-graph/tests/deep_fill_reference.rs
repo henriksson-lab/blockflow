@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use blockflow::npy::{read_array_file, OrderPolicy};
 use blockflow::voxels::Voxels;
-use blockflow_vessel_graph::segment::{deep_fill, DeepFillOutput, DeepFillParams, DeepFillSetup};
+use blockflow_vessel_graph::segment::{
+    deep_fill, DeepFillDevice, DeepFillOutput, DeepFillParams, DeepFillSetup,
+};
 use ndarray::{Array3, Ix3};
 
 fn reference() -> PathBuf {
@@ -24,6 +26,21 @@ fn reference() -> PathBuf {
             "/husky/henriksson/lightsheet-reference/vessel-filling".to_string()
         }),
     )
+}
+
+/// Where the comparisons run the network: `$VESSEL_FILL_DEVICE` (cpu, gpu or
+/// auto), default cpu.
+fn device() -> DeepFillDevice {
+    std::env::var("VESSEL_FILL_DEVICE")
+        .map(|text| DeepFillDevice::parse(&text).expect("cpu, gpu or auto"))
+        .unwrap_or(DeepFillDevice::Cpu)
+}
+
+fn setup() -> DeepFillSetup {
+    DeepFillSetup {
+        device: device(),
+        ..DeepFillSetup::default()
+    }
 }
 
 fn load<T: Clone + blockflow::npy::NpyElement>(path: &Path) -> Array3<T> {
@@ -70,7 +87,7 @@ fn small_crop_probability_matches_the_reference_network() {
         &DeepFillParams::default(),
         &DeepFillSetup {
             block: shape,
-            ..DeepFillSetup::default()
+            ..setup()
         },
         DeepFillOutput::Probability,
     )
@@ -168,7 +185,7 @@ fn crop_against_the_reference() {
         let input: Array3<bool> = load(&dir.join("input").join(format!("{label}.npy")));
         let shape = [input.shape()[0], input.shape()[1], input.shape()[2]];
         let params = DeepFillParams::resampled(resample);
-        let setup = DeepFillSetup::default();
+        let setup = setup();
         let started = Instant::now();
         let filled = deep_fill(
             Voxels::Bool(input.clone()),
@@ -291,7 +308,7 @@ fn crop_timing() {
             let filled = deep_fill(
                 Voxels::Bool(input.clone()),
                 &DeepFillParams::resampled(resample),
-                &DeepFillSetup::default(),
+                &setup(),
                 DeepFillOutput::Filled,
             )
             .unwrap();
@@ -306,5 +323,73 @@ fn crop_timing() {
                 started.elapsed().as_secs_f64()
             );
         }
+    }
+}
+
+#[cfg(feature = "deep-fill-gpu")]
+#[test]
+#[ignore = "needs a GPU, the converted weights ($VESSEL_FILL_WEIGHTS) and the crop's masks under \
+            $VESSEL_FILL_REFERENCE/crop/input"]
+fn crop_gpu_against_cpu() {
+    let dir = reference().join("crop").join("input");
+    for (label, resample) in [("vessel-vessel-mask", 1usize), ("vessel-artery-mask", 2)] {
+        let input: Array3<bool> = load(&dir.join(format!("{label}.npy")));
+        let params = DeepFillParams::resampled(resample);
+        let mut answers = Vec::new();
+        for device in [DeepFillDevice::Cpu, DeepFillDevice::Gpu] {
+            let setup = DeepFillSetup {
+                device,
+                ..DeepFillSetup::default()
+            };
+            let mut seconds = Vec::new();
+            let mut last = None;
+            for _ in 0..3 {
+                let started = Instant::now();
+                let p = deep_fill(
+                    Voxels::Bool(input.clone()),
+                    &params,
+                    &setup,
+                    DeepFillOutput::Probability,
+                )
+                .unwrap();
+                seconds.push(started.elapsed().as_secs_f64());
+                last = Some(p);
+            }
+            let probability = last.unwrap().view::<f32>().unwrap().to_owned();
+            let filled = deep_fill(
+                Voxels::Bool(input.clone()),
+                &params,
+                &setup,
+                DeepFillOutput::Filled,
+            )
+            .unwrap()
+            .view::<bool>()
+            .unwrap()
+            .to_owned();
+            println!(
+                "{label}, resample {resample}, {device:?}: probability in {:?} s, fills to {}",
+                seconds
+                    .iter()
+                    .map(|s| format!("{s:.2}"))
+                    .collect::<Vec<_>>(),
+                count(&filled)
+            );
+            answers.push((probability, filled));
+        }
+        let ((p_cpu, f_cpu), (p_gpu, f_gpu)) = (&answers[0], &answers[1]);
+        let (max, r, n) = agreement(p_gpu, p_cpu);
+        let mean = p_gpu
+            .iter()
+            .zip(p_cpu)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .sum::<f64>()
+            / n as f64;
+        let differ = f_gpu.iter().zip(f_cpu).filter(|(a, b)| a != b).count();
+        println!(
+            "  gpu against cpu: probability max |diff| {max:.2e}, mean {mean:.2e}, r {r:.9}; \
+             filled masks differ in {differ} of {n} voxels, Dice {:.7}",
+            dice(f_gpu, f_cpu)
+        );
+        assert!(max < 1e-3, "{label}: {max}");
     }
 }

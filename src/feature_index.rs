@@ -15,6 +15,14 @@ use std::{
     path::{Path, PathBuf},
 };
 const META_LIMIT: u64 = 16384;
+/// Physical page layout. Feature ordering, bindings and retention are identical.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PageLayout {
+    #[default]
+    Files,
+    /// Version 2: append-only page payload plus fixed-width offset directory.
+    Packed,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Geometry {
@@ -75,6 +83,22 @@ pub struct Feature {
     pub weight: f64,
     pub scale: f64,
 }
+fn anchor_roundoff_voxels(origin: f64, position: f64, spacing: f64, extent: f64) -> Result<f64> {
+    let magnitude = extent
+        .abs()
+        .max(1.)
+        .max((origin / spacing).abs())
+        .max((position / spacing).abs());
+    let roundoff = 16. * f64::EPSILON * magnitude;
+    // Refuse an unresolvable frame instead of making roundoff a substantial
+    // extra displacement allowance.
+    if !roundoff.is_finite() || roundoff >= 0.25 {
+        return Err(Error::invalid(
+            "feature world coordinates lack subvoxel precision",
+        ));
+    }
+    Ok(roundoff)
+}
 impl Feature {
     fn checked(mut self, g: &Geometry, cell: [usize; 3]) -> Result<Self> {
         if g.cell_of(self.at_zyx)? != cell
@@ -88,9 +112,16 @@ impl Feature {
         for i in 0..3 {
             let q = (self.position_xyz[i] - g.origin_xyz[i]) / g.spacing_xyz[i];
             let delta = (q - self.at_zyx[2 - i] as f64).abs();
-            if !delta.is_finite()
-                || delta > g.max_offset_voxels + 16. * f64::EPSILON * q.abs().max(1.)
-            {
+            // World-coordinate construction rounds at the magnitude of the
+            // origin/position, not only at the small local voxel coordinate.
+            // Include both before testing a boundary such as +/- half a voxel.
+            let roundoff_voxels = anchor_roundoff_voxels(
+                g.origin_xyz[i],
+                self.position_xyz[i],
+                g.spacing_xyz[i],
+                q.abs().max(self.at_zyx[2 - i] as f64),
+            )?;
+            if !delta.is_finite() || delta > g.max_offset_voxels + roundoff_voxels {
                 return Err(Error::invalid(
                     "feature exceeds declared anchor displacement",
                 ));
@@ -373,7 +404,7 @@ fn lease(memory: &MemoryBudget, bytes: u64, b: &mut Budget) -> Option<crate::bud
 }
 fn check_meta(m: &Metadata) -> Result<()> {
     m.geometry.validate()?;
-    if m.version != 1
+    if !matches!(m.version, 1 | 2)
         || m.per_cell_limit == 0
         || m.per_cell_limit > 4096
         || m.binding_sha256.len() != 64
@@ -387,9 +418,21 @@ pub struct Writer {
     root: PathBuf,
     meta: Metadata,
     directory: File,
+    packed: Option<PackedOutput>,
     last: Option<[usize; 3]>,
     poisoned: bool,
     memory: MemoryBudget,
+}
+struct PackedOutput {
+    pages: File,
+    offsets: File,
+    bytes: u64,
+}
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .map_err(Error::backend)?
+        .sync_all()
+        .map_err(Error::backend)
 }
 impl Writer {
     pub fn create(
@@ -399,8 +442,27 @@ impl Writer {
         per_cell_limit: usize,
         memory: MemoryBudget,
     ) -> Result<Self> {
+        Self::create_with_layout(
+            root,
+            geometry,
+            binding_sha256,
+            per_cell_limit,
+            memory,
+            PageLayout::Files,
+        )
+    }
+    /// Packed publication synchronizes payload/offset/key files before sealing.
+    /// Existing create() keeps its version-1 layout and publication behavior.
+    pub fn create_with_layout(
+        root: impl Into<PathBuf>,
+        geometry: Geometry,
+        binding_sha256: String,
+        per_cell_limit: usize,
+        memory: MemoryBudget,
+        layout: PageLayout,
+    ) -> Result<Self> {
         let meta = Metadata {
-            version: 1,
+            version: if layout == PageLayout::Packed { 2 } else { 1 },
             sealed: false,
             binding_sha256,
             geometry,
@@ -423,10 +485,28 @@ impl Writer {
             .create_new(true)
             .open(root.join("cells.bin"))
             .map_err(Error::backend)?;
+        let packed = if layout == PageLayout::Packed {
+            Some(PackedOutput {
+                pages: OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(root.join("pages.bin"))
+                    .map_err(Error::backend)?,
+                offsets: OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(root.join("page_offsets.bin"))
+                    .map_err(Error::backend)?,
+                bytes: 0,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             root,
             meta,
             directory,
+            packed,
             last: None,
             poisoned: false,
             memory,
@@ -521,10 +601,28 @@ impl Writer {
                 )?;
             }
             let bytes = encoded.encode();
-            if !b.write(bytes.len() as u64 + 24) {
+            let directory_bytes = if self.packed.is_some() { 40 } else { 24 };
+            if !b.write(bytes.len() as u64 + directory_bytes) {
                 return Ok(b.stopped());
             }
-            atomic(&page(&self.root, key), &bytes)?;
+            if let Some(packed) = &mut self.packed {
+                let end = packed
+                    .bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| Error::invalid("packed feature payload overflow"))?;
+                packed.pages.write_all(&bytes).map_err(Error::backend)?;
+                packed
+                    .offsets
+                    .write_all(&packed.bytes.to_le_bytes())
+                    .map_err(Error::backend)?;
+                packed
+                    .offsets
+                    .write_all(&(bytes.len() as u64).to_le_bytes())
+                    .map_err(Error::backend)?;
+                packed.bytes = end;
+            } else {
+                atomic(&page(&self.root, key), &bytes)?;
+            }
             for value in key {
                 self.directory
                     .write_all(&(value as u64).to_le_bytes())
@@ -555,7 +653,22 @@ impl Writer {
         if self.poisoned {
             return Err(Error::invalid("cannot seal a partial/failed feature index"));
         }
+        if let Some(packed) = &self.packed {
+            packed.pages.sync_all().map_err(Error::backend)?;
+            packed.offsets.sync_all().map_err(Error::backend)?;
+        }
         self.directory.sync_all().map_err(Error::backend)?;
+        if self.packed.is_some() {
+            // Persist data-file names and the new root before publishing the
+            // sealed manifest. Ancestors of the supplied parent are caller-owned.
+            sync_directory(&self.root)?;
+            sync_directory(
+                self.root
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            )?;
+        }
         self.meta.sealed = true;
         // Publication replaces the manifest only after all pages/directory are
         // complete. No resumability or concurrent writers are claimed.
@@ -564,6 +677,11 @@ impl Writer {
             &path,
             &serde_json::to_vec(&self.meta).map_err(Error::backend)?,
         )?;
+        if self.packed.is_some() {
+            // If this post-rename sync fails, a complete sealed index can be
+            // visible despite Err; the caller must not record successful seal.
+            sync_directory(&self.root)?;
+        }
         Ok(self.meta)
     }
 }
@@ -835,6 +953,22 @@ impl Reader {
         if directory.metadata().map_err(Error::backend)?.len() != expected {
             return Err(Error::invalid("truncated feature cell directory"));
         }
+        if meta.version == 2 {
+            let offsets = fs::metadata(root.join("page_offsets.bin")).map_err(Error::backend)?;
+            let bytes = meta
+                .occupied_cells
+                .checked_mul(16)
+                .ok_or_else(|| Error::invalid("packed offset directory overflow"))?;
+            if offsets.len() != bytes {
+                return Err(Error::invalid("truncated packed feature offset directory"));
+            }
+            let payload = fs::metadata(root.join("pages.bin")).map_err(Error::backend)?;
+            if (meta.occupied_cells == 0) != (payload.len() == 0) {
+                return Err(Error::invalid(
+                    "packed feature payload disagrees with occupied directory",
+                ));
+            }
+        }
         let cache = ReadCache::new(cache, memory.clone());
         Ok(Self {
             root,
@@ -957,7 +1091,7 @@ impl Reader {
         self.last = Some(key);
         Ok(Outcome::Complete(Some(key)))
     }
-    fn contains_cell(&self, key: [usize; 3], b: &mut Budget) -> Result<Outcome<bool>> {
+    fn contains_cell(&self, key: [usize; 3], b: &mut Budget) -> Result<Outcome<Option<u64>>> {
         if self.cache.config.max_bytes == 0 {
             return self.contains_cell_uncached(key, b);
         }
@@ -973,14 +1107,18 @@ impl Reader {
                 Outcome::Stopped(_) => return Ok(b.stopped()),
             };
             match found.cmp(&key) {
-                Ordering::Equal => return Ok(Outcome::Complete(true)),
+                Ordering::Equal => return Ok(Outcome::Complete(Some(mid))),
                 Ordering::Less => low = mid + 1,
                 Ordering::Greater => high = mid,
             }
         }
-        Ok(Outcome::Complete(false))
+        Ok(Outcome::Complete(None))
     }
-    fn contains_cell_uncached(&self, key: [usize; 3], b: &mut Budget) -> Result<Outcome<bool>> {
+    fn contains_cell_uncached(
+        &self,
+        key: [usize; 3],
+        b: &mut Budget,
+    ) -> Result<Outcome<Option<u64>>> {
         // A separate file description avoids changing the streaming cursor or
         // sharing seek offsets between independent read-only queries.
         let mut file = File::open(self.root.join("cells.bin")).map_err(Error::backend)?;
@@ -1006,12 +1144,12 @@ impl Reader {
                 .map_err(Error::backend)?;
             }
             match found.cmp(&key) {
-                Ordering::Equal => return Ok(Outcome::Complete(true)),
+                Ordering::Equal => return Ok(Outcome::Complete(Some(mid))),
                 Ordering::Less => low = mid + 1,
                 Ordering::Greater => high = mid,
             }
         }
-        Ok(Outcome::Complete(false))
+        Ok(Outcome::Complete(None))
     }
     pub fn read_cell(
         &self,
@@ -1051,24 +1189,50 @@ impl Reader {
                 return Ok(Outcome::Complete(points));
             }
         }
-        match self.contains_cell(key, b)? {
+        let ordinal = match self.contains_cell(key, b)? {
             Outcome::Stopped(_) => return Ok(b.stopped()),
-            Outcome::Complete(false) => return Ok(Outcome::Complete(vec![])),
-            Outcome::Complete(true) => {}
-        }
+            Outcome::Complete(None) => return Ok(Outcome::Complete(vec![])),
+            Outcome::Complete(Some(index)) => index,
+        };
         let path = page(&self.root, key);
-        let info = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::invalid(
-                    "sealed feature index is missing an indexed page",
-                ))
+        let (bytes, mut packed_file) = if self.meta.version == 2 {
+            if !b.directory_read(16) {
+                return Ok(b.stopped());
             }
-            Err(e) => return Err(Error::backend(e)),
+            let mut offsets =
+                File::open(self.root.join("page_offsets.bin")).map_err(Error::backend)?;
+            offsets
+                .seek(SeekFrom::Start(ordinal.checked_mul(16).ok_or_else(
+                    || Error::invalid("packed offset position overflow"),
+                )?))
+                .map_err(Error::backend)?;
+            let mut raw = [0u8; 16];
+            offsets.read_exact(&mut raw).map_err(Error::backend)?;
+            let offset = u64::from_le_bytes(raw[..8].try_into().unwrap());
+            let bytes = u64::from_le_bytes(raw[8..].try_into().unwrap());
+            let end = offset
+                .checked_add(bytes)
+                .ok_or_else(|| Error::invalid("packed feature range overflow"))?;
+            let mut file = File::open(self.root.join("pages.bin")).map_err(Error::backend)?;
+            if end > file.metadata().map_err(Error::backend)?.len() {
+                return Err(Error::invalid("packed feature range exceeds payload"));
+            }
+            file.seek(SeekFrom::Start(offset)).map_err(Error::backend)?;
+            (bytes, Some(file))
+        } else {
+            let info = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::invalid(
+                        "sealed feature index is missing an indexed page",
+                    ))
+                }
+                Err(e) => return Err(Error::backend(e)),
+            };
+            (info.len(), None)
         };
         let header = encoded_header_bytes(&schema());
         let width = encoded_row_bytes(&schema());
-        let bytes = info.len();
         if bytes < header
             || (bytes - header) % width != 0
             || (bytes - header) / width > self.meta.per_cell_limit as u64
@@ -1092,7 +1256,14 @@ impl Reader {
         if !b.page_read(bytes) {
             return Ok(b.stopped());
         }
-        let data = fs::read(path).map_err(Error::backend)?;
+        let data = if let Some(file) = &mut packed_file {
+            let len = usize::try_from(bytes).map_err(Error::backend)?;
+            let mut data = vec![0u8; len];
+            file.read_exact(&mut data).map_err(Error::backend)?;
+            data
+        } else {
+            fs::read(path).map_err(Error::backend)?
+        };
         if data.len() as u64 != bytes {
             return Err(Error::invalid("feature page changed during read"));
         }
@@ -1194,10 +1365,20 @@ impl Reader {
         let mut hi = [0usize; 3];
         for i in 0..3 {
             let q = (position[i] - g.origin_xyz[i]) / g.spacing_xyz[i];
-            let pad = radius / g.spacing_xyz[i] + g.max_offset_voxels;
+            let mut pad = radius / g.spacing_xyz[i] + g.max_offset_voxels;
             if !q.is_finite() || !pad.is_finite() {
                 return Err(Error::invalid("feature neighborhood coordinate overflow"));
             }
+            // Include query conversion and admitted point-construction roundoff
+            // in broad-phase bounds, including tiny queries at cell seams.
+            // The final physical-distance filter is unchanged.
+            pad += 2.
+                * anchor_roundoff_voxels(
+                    g.origin_xyz[i],
+                    position[i],
+                    g.spacing_xyz[i],
+                    q.abs() + pad + 1.,
+                )?;
             if q + pad < 0. || q - pad > (g.shape_zyx[2 - i] - 1) as f64 {
                 return Ok(Outcome::Complete(Neighbors {
                     points: vec![],

@@ -16,39 +16,104 @@ their `compare.py`); nothing in it is a library.
 ```sh
 cd examples/lightsheet-pipeline/benchmark
 python3 bench.py list                         # workloads, sizes, expected durations, differences
-python3 bench.py run --smoke --repeats 1      # every workload at its smoke size (~40 min in all)
+python3 bench.py run --smoke --threads 6 --repeats 1      # every workload at its smoke size
 python3 bench.py summarize --max-load 8
 ```
 
-**The full benchmark, when the machine is quiet** (about 10–14 hours at
-`--repeats 3`; see the durations below; run it in `tmux`):
+The smoke size of every workload is its smallest (crops, level 3, the
+affine only); `--smoke` picks it for every workload named, or for all.
+At 6 threads on the loaded machine one smoke pass (both sides of every
+workload, with the checks) took about 17 min; `--warm run --repeats 2` about
+50 min (see "Smoke run (2026-10-23)"). Workloads
+may be named before or after the options.
+
+### The overnight run
+
+Run it in `tmux`, from this directory:
 
 ```sh
 cd examples/lightsheet-pipeline/benchmark
 python3 bench.py run --build \
     stitch-sa3x8:harness stitch-cztq2:l2 register:full cells:tile \
     vessels:region vessels-deepfill:region e2e:full \
-    --threads 40 --repeats 3 --warm run --max-load 4 --wait-max-s 3600
+    --threads 40 --repeats 1 --max-load 4 --wait-max-s 3600 \
+    2>&1 | tee /husky/henriksson/lightsheet-reference/benchmark/overnight-$(date +%Y%m%d).log
 python3 bench.py summarize --max-load 4 --exclude-loaded
 ```
 
+**Before you start:**
+
+- **Other jobs:** stop them, or the load waits stretch the night. Check
+  `uptime` (nothing else using the cores) and `top`. No other agent may build
+  in blockflow: `--build` writes `target/release/`, and a rebuild during
+  the night would swap binaries between repeats (each row records the
+  binaries' hashes, so a swap shows in `provenance`).
+- **Disk:** `df -h /husky` (about 30 GB needed; the inputs below, about
+  11 GB, are prepared already) and `df -h /data` (only the cargo build).
+- **GPU:** not used by this command (deep filling runs on the CPU on both
+  sides). With `--deep-fill-gpu`, check `nvidia-smi` that the GPU is free;
+  `--build` then builds `vessel-graph` with `deep-fill-cuda`.
+- **Memory:** about 20 GB free is plenty (the largest tree, the reference's
+  deep fill or e2e, peaks under 12 GB PSS at 40 processes).
+- The checkout is the one measured: commit or note the uncommitted paths
+  (`blockflow_dirty` in every row).
+
+**Duration** (estimated from the smoke runs, the earlier harness numbers
+and the data sizes; nothing at these sizes has been timed by this driver
+yet). One run of each side per workload, no warm-up run (the inputs are
+read into the page cache first, untimed).
+
+| workload:size | reference / blockflow, min per run |
+|---|---|
+| stitch-sa3x8:harness | 1.5 / 1 |
+| stitch-cztq2:l2 | 5-15 / 1-3 |
+| register:full | 5-9 / 1.5 |
+| cells:tile | 1.5-3 / 1.5-3 |
+| vessels:region | 3-5 / 1.5-3 |
+| vessels-deepfill:region | 4-6 / 2-4 |
+| e2e:full | 20-35 / 5-10 |
+
+That is 1-1.5 hours of runs plus the checks (about 20 min). The wait before
+each run samples the busy cores over 5 s, so on an idle machine it costs
+seconds; other jobs can add up to `--wait-max-s` per run. **Expect about
+1.5-2 hours.** One run per side gives no spread; a run disturbed by
+another job shows in `other_cores_mean`.
+
+**Disk** under `/husky/henriksson/lightsheet-reference/benchmark/`: the
+inputs (`inputs/`, 11 GB, already prepared; `run` prepares what is missing,
+untimed) and the last repeat's outputs per workload: about 2.5 GB
+(sa3x8 stitch), 6 GB (cztq2 stitch), 7 GB (e2e: the reference's stitched
+`.npy` and blockflow's fused pyramid), 2.5 GB (both vessel workloads) and a
+little for the rest; earlier repeats keep only small files. **About 20 GB
+new, 30 GB at the peak.**
+
+Flags:
+
 - `--build` runs `cargo build --release -p` for the four packages
-  (`vessel-graph` with `--features deep-fill`) first; the binaries' hashes and
-  build times are recorded either way.
+  (`vessel-graph` with `--features deep-fill`, or `deep-fill-cuda` with
+  `--deep-fill-gpu`) first; the binaries' hashes and build times are
+  recorded either way.
 - `--warm run` does one discarded run of each side before the measured
   repeats (the reference's first process after a while pays several seconds,
   up to tens, for imports and its compiled extensions; the default `--warm
   read` only reads the inputs into the page cache).
 - `--max-load 4 --wait-max-s 3600`: before each run, wait up to an hour for
-  the 1-minute load to fall to 4; a run that starts above it anyway is
+  the busy cores (from `/proc/stat` over 5 s; the 1-minute load lags minutes
+  behind) to fall to 4 (then the inputs are read into the page cache, then
+  the run starts); a run that starts above it anyway is
   flagged, and `--exclude-loaded` leaves it out of the summary.
 - For a scaling point add a second pass with `--threads 16`; the summary
   groups by thread count.
 - Bigger sizes (`stitch-sa3x8:l1`, `stitch-cztq2:l1`) prepare 4 and 21 GB of
   `.npy` and take much longer; run them separately.
 
-Each `run` ends with the summary. Interrupting with Ctrl-C stops the run in
-progress (the signal reaches the whole tree); rows already written stay.
+Each `run` ends with the summary. A workload that fails outside its
+measured commands (its preparation, a missing input) is reported, recorded
+in `results/failures.jsonl` and skipped, and the run goes on with the next
+workload; a failed command is a row with a non-zero `exit` (its log is
+`work/.../<side>/log.txt`), and a failing check is a record with an
+`error`. Interrupting with Ctrl-C stops the run in progress (the signal
+reaches the whole tree); rows already written stay.
 
 ## Files
 
@@ -136,7 +201,11 @@ manifest).
 - **Threads**: `--threads N` (default all cores) sets `OMP_NUM_THREADS`,
   `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS`,
   `NUMEXPR_MAX_THREADS`, `VECLIB_MAXIMUM_THREADS`, `BLIS_NUM_THREADS` and
-  `RAYON_NUM_THREADS` for both sides, and each tool's own flag: every
+  `RAYON_NUM_THREADS` for both sides, `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS`
+  (elastix and transformix: with `-threads N` alone their ITK pool keeps
+  all cores and its idle workers spin, 1665 s of CPU in 79 s at
+  `-threads 6`; capped, 254 s in 58 s with the same transform), and each
+  tool's own flag: every
   `processes`/`n_processes` of the reference, elastix/transformix `-threads`,
   `torch.set_num_threads`, `cell-density --workers`, `vessel-graph --workers`.
   The reference's worker pools are fork-based and each worker's OpenMP/BLAS
@@ -150,8 +219,9 @@ manifest).
   measurement.
 - **Repeats, alternated**: `--repeats R`; the side that goes first alternates
   (reference first in even repeats, blockflow first in odd ones).
-- **Load**: `--max-load L` flags runs that start above it; `--wait-max-s S`
-  waits for the load to drop first. The load before, during and after, and
+- **Load**: `--max-load L` flags runs that start with more than L cores busy
+  (`busy_cores_before`; older rows: the 1-minute load); `--wait-max-s S`
+  waits for them to drop first. The load before, during and after, and
   the other jobs' cores, are in every row.
 - **Page cache**: without root the caches cannot be dropped. `--warm read`
   (default) reads each side's inputs once right before its run (the row says
@@ -177,6 +247,8 @@ manifest).
   other_cores_mean, over_max_load, cache, started, blockflow_commit,
   blockflow_dirty, clearmap_commit, out`);
 - `checks.jsonl`: one record per checked repeat (the run ids it covers);
+- `failures.jsonl`: one record per workload aborted outside its measured
+  commands (the error and traceback);
 - `summary.md`, `summary.json`: written by `summarize` — per workload, size,
   thread count and side, the median and range of wall time and the medians
   of CPU, tree RSS, tree PSS and the largest process, the median load before,
@@ -225,8 +297,12 @@ workload.
 - The reference smooths each tile's positions over the whole stack (including
   slices outside the tile), blockflow over the tile's own slices.
 - blockflow writes one level (`--out-levels 1`), as the reference writes one
-  array. osf-cztq2 needs `--overlap 120,120` (its conversion carries no tile
-  translations); the reference gets the same overlap.
+  array. The reference gets the overlap as `--overlap` (osf-cztq2 120,
+  120 level-0 voxels; osf-sa3x8 212, 66). blockflow is given the same, but
+  tiles whose NGFF translations place them are placed by those instead
+  (`--overlap` is then ignored, with a note in the log): osf-cztq2's tiles
+  carry grid translations since 2026-10-22, a pitch of 888 x 884 level-0
+  voxels (overlap 119, 120), the same stitch as `--overlap 120,120` gave.
 
 **Registration**
 
@@ -343,6 +419,55 @@ judged in the same convention.
 - For region counts against the reference, its shipped numbers (corner
   points plus truncation) are what users of it get; they agree with ours to
   95% on this box, and 97% once the conventions match.
+
+## Smoke run (2026-10-23)
+
+After round 3 (executor, pyramid writer, stitching, `--memory-mb`,
+`--deep-fill-device`, `--initialise search`, the new `run.sh` and params):
+every workload at its smoke size with the overnight options, `--threads 6
+--warm run --repeats 2`, binaries of 2026-10-23 09:54, on the shared
+machine at a 1-minute load of 10-58 (other agents running). All 42 runs (14 warm-ups)
+exited 0, both sides alternated first, and all 14 checks passed with the
+numbers of the 2026-10-20 run. Results in
+`/husky/henriksson/lightsheet-reference/round4/I/bench/results/`. **These
+show that the scripts work; the times are not measurements.**
+
+| workload:size | side | wall s | CPU s | tree PSS GB | check |
+|---|---|---|---|---|---|
+| stitch-sa3x8:smoke | reference | 20.8, 19.1 | 62 | 1.72 | rigid identical |
+| | blockflow | 15.4, 13.8 | 39-44 | 1.03-1.07 | |
+| stitch-cztq2:smoke | reference | 8.3, 5.0 | 11 | 0.19 | rigid identical; pairs within 1 voxel |
+| | blockflow | 1.4, 1.1 | 3-4 | 0.19 | |
+| register:smoke | reference | 79.5, 79.1; 57.7 capped | 1674, 1665; 254 capped | 2.5 | point grid median 15.2 µm |
+| | blockflow | 13.0, 12.9 | 64 | 1.3 | |
+| cells:smoke | reference | 9.0, 9.9 | 45-48 | 1.4 | precision 98.7%, recall 98.0% (filtered 97.7% / 87.7%) |
+| | blockflow | 15.4, 16.8 | 29 | 1.1 | |
+| vessels:smoke | reference | 165.8, 166.1 | 901-922 | 3.8 | mask Dice 0.982 |
+| | blockflow | 58.6, 56.5 | 226-234 | 2.7-2.8 | |
+| vessels-deepfill:smoke | reference | 165.9, 123.6 | 735-889 | 7.7 | mask Dice 0.913 |
+| | blockflow | 63.2, 59.7 | 234-254 | 2.8-2.9 | |
+| e2e:smoke | reference | 387.7, 371.7; 257.7 capped | 3913, 3843; 987 capped | 3.0 | 549 matched; region 95.5% shipped, 97.3% voxel centres; 4.1 µm |
+| | blockflow | 82.9, 52.7 | 198-267 | 2.4-2.5 | |
+
+Fixed in the scripts while making it work:
+
+- `bench.py` parsed its arguments with `parse_args`, so workloads named
+  after an option (`run --smoke stitch-sa3x8 ...`, and the overnight
+  command above) were refused ("unrecognized arguments"); it now uses
+  `parse_intermixed_args`.
+- elastix and transformix kept ITK's pool at all 40 cores whatever
+  `-threads` said, its idle workers spinning: the reference's registration
+  CPU time was 6.6 times what the asked-for threads do. `--threads` now
+  also sets `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` ("capped" above: the
+  same transform, CPU 1665 -> 254 s, wall 79 -> 58 s). The registration and
+  e2e reference CPU times of the 2026-10-20 run are inflated by this.
+- One workload's exception (a preparation failing, a missing input) ended
+  the whole run; it is now recorded in `failures.jsonl` and the run goes on.
+  A check or a side's timing file that raises is recorded as an `error`.
+- The load wait came after the page-cache warm-up, so an hour's wait could
+  undo it; it now comes first.
+- The e2e cleanup left blockflow's `cells/density.ome.zarr` (240 MB) in
+  every repeat.
 
 ## Smoke run (2026-10-20)
 

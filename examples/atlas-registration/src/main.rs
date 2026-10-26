@@ -9,9 +9,10 @@ use blockflow_atlas_registration::compute::{
     params_from_elastix_map, ControlGrid, Metric, PyramidSchedule, Sampling, VolumeFitParams,
 };
 use blockflow_atlas_registration::pipeline::{
-    register, register_chain, transform_points, ChainConfig, Initialisation, Input, PointSource,
-    PointsConfig, RegisterConfig, RegisterSummary, Stage, Units,
+    place, register, register_chain, transform_points, ChainConfig, Initialisation, Input,
+    PointSource, PointsConfig, RegisterConfig, RegisterSummary, Stage, Units,
 };
+use blockflow_atlas_registration::place::SearchParams;
 use blockflow_atlas_registration::stochastic::{
     is_stochastic, stochastic_from_elastix_map, RelativeTolerance,
 };
@@ -24,10 +25,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Memory cap in MiB for the planned volume phases and their chunk caches
-    /// (default: $BLOCKFLOW_MEMORY_CAP, else the cgroup's limit, else a share
-    /// of the machine). The registration's own resident volumes are not
-    /// planned and are not bounded by it.
+    /// Memory cap in MiB (default: $BLOCKFLOW_MEMORY_CAP, else the cgroup's
+    /// limit, else a share of the machine). The planned phases and their chunk
+    /// caches run under it; the resident volumes (lattices, the fit's copies,
+    /// images read whole, the search's pyramids) are leased from it, and a run
+    /// whose volumes a stated or cgroup cap cannot hold stops, naming the cap
+    /// that would.
     #[arg(long, global = true)]
     memory_mb: Option<u64>,
 }
@@ -41,6 +44,9 @@ enum Command {
     Chain(ChainArgs),
     /// Carry a CSV point table through a registration.
     TransformPoints(PointsArgs),
+    /// Find where the fixed image lies in the moving one (the translation
+    /// `--initialise search` starts a registration from), without fitting.
+    Place(PlaceArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -85,8 +91,9 @@ struct RegisterArgs {
     out: PathBuf,
     /// How the first stage starts (stochastic stages): `parameters` (as the
     /// file's AutomaticTransformInitialization says), `physical` (the images'
-    /// physical frames as they stand, elastix's "false"), or `centre` (their
-    /// geometric centres, elastix's "true" with GeometricalCenter).
+    /// physical frames as they stand, elastix's "false"), `centre` (their
+    /// geometric centres, elastix's "true" with GeometricalCenter), or
+    /// `search` (the translation a correlation search finds; see `place`).
     #[arg(
         long,
         default_value = "parameters",
@@ -109,6 +116,8 @@ struct RegisterArgs {
     parameters: Vec<PathBuf>,
     #[command(flatten)]
     stochastic: StochasticArgs,
+    #[command(flatten)]
+    search: SearchArgs,
     /// Gauss-Newton iterations per stage.
     #[arg(long, default_value_t = 64)]
     iterations: usize,
@@ -142,6 +151,69 @@ struct RegisterArgs {
     block: usize,
 }
 
+/// Options of the placement search (`--initialise search`, `place`).
+#[derive(Args, Clone)]
+struct SearchArgs {
+    /// Pyramid levels of the search, the registration lattice included;
+    /// default: down to where the fixed image is 16 voxels across (at most 8x).
+    #[arg(long)]
+    search_levels: Option<usize>,
+    /// Least overlap a translation may have, as a fraction of the smaller
+    /// image.
+    #[arg(long, default_value_t = 0.5)]
+    search_min_overlap: f64,
+    /// Refuse a best match whose normalised cross-correlation is below this.
+    #[arg(long, default_value_t = 0.2)]
+    search_min_peak: f64,
+    /// Refuse when a distinct second match comes within this NCC of the best.
+    #[arg(long, default_value_t = 0.05)]
+    search_min_margin: f64,
+    /// Correlate intensities as they are rather than ln(1 + v).
+    #[arg(long)]
+    search_linear: bool,
+}
+
+impl SearchArgs {
+    fn params(&self) -> SearchParams {
+        SearchParams {
+            levels: self.search_levels,
+            min_overlap: self.search_min_overlap,
+            min_peak: self.search_min_peak,
+            min_margin: self.search_min_margin,
+            log_intensity: !self.search_linear,
+            ..SearchParams::default()
+        }
+    }
+
+    /// `initialisation` with a search's settings put in.
+    fn apply(&self, initialisation: Initialisation) -> Initialisation {
+        match initialisation {
+            Initialisation::Search(_) => Initialisation::Search(self.params()),
+            other => other,
+        }
+    }
+}
+
+#[derive(Args)]
+struct PlaceArgs {
+    #[arg(long)]
+    fixed: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    fixed_channel: usize,
+    #[arg(long)]
+    moving: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    moving_channel: usize,
+    /// Search lattice voxel size, `s` or `z,y,x` (the registration's).
+    #[arg(long, value_parser = parse_triple)]
+    resolution: Option<[f64; 3]>,
+    #[command(flatten)]
+    search: SearchArgs,
+    /// Also write the placement here as JSON.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
 /// Options of the stochastic fit (elastix parameter files).
 #[derive(Args, Clone)]
 struct StochasticArgs {
@@ -173,7 +245,8 @@ struct ChainArgs {
     #[arg(long, value_parser = parse_triple)]
     resolution: Option<[f64; 3]>,
     /// `STEP=MODE`: how step STEP's first stage starts, `parameters`
-    /// (default), `physical` or `centre` (see `register --initialise`).
+    /// (default), `physical`, `centre` or `search` (see `register
+    /// --initialise`).
     #[arg(long = "initialise", num_args = 1)]
     initialise: Vec<String>,
     /// `STEP=Z,Y,X`: start step STEP from the physical frames with its fixed
@@ -189,6 +262,8 @@ struct ChainArgs {
     warped: bool,
     #[command(flatten)]
     stochastic: StochasticArgs,
+    #[command(flatten)]
+    search: SearchArgs,
     #[arg(long, default_value_t = 64)]
     block: usize,
 }
@@ -381,7 +456,10 @@ fn run_chain(args: &ChainArgs) -> Result<()> {
         )));
     }
     let initialisation =
-        chain_initialisation(steps_count, &args.initialise, &args.initial_translation)?;
+        chain_initialisation(steps_count, &args.initialise, &args.initial_translation)?
+            .into_iter()
+            .map(|i| args.search.apply(i))
+            .collect();
     let summaries = register_chain(&ChainConfig {
         images: args
             .images
@@ -479,7 +557,7 @@ fn run_register(args: &RegisterArgs) -> Result<()> {
         warped_stages: args.stochastic.warped_stages,
         initialisation: match args.initial_translation {
             Some(t) => Initialisation::Translation(t),
-            None => Initialisation::parse(&args.initialise)?,
+            None => args.search.apply(Initialisation::parse(&args.initialise)?),
         },
     };
     let summary = register(&config)?;
@@ -523,19 +601,76 @@ fn run_points(args: &PointsArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_place(args: &PlaceArgs) -> Result<()> {
+    let params = args.search.params();
+    let placement = place(
+        &Input {
+            path: args.fixed.clone(),
+            channel: args.fixed_channel,
+            level: None,
+        },
+        &Input {
+            path: args.moving.clone(),
+            channel: args.moving_channel,
+            level: None,
+        },
+        args.resolution,
+        &params,
+    )?;
+    let record = placement.to_json(&params);
+    if let Some(path) = &args.out {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&record).map_err(Error::backend)?,
+        )
+        .map_err(Error::backend)?;
+    }
+    let t = placement.translation();
+    println!(
+        "translation={:.2},{:.2},{:.2} ncc={:.4} margin={:.4} seconds={:.2}",
+        t[0],
+        t[1],
+        t[2],
+        placement.best.ncc,
+        placement.margin(),
+        placement.seconds
+    );
+    Ok(())
+}
+
+/// A fixed 1 MiB mmap threshold under a binding cap. The images are read a
+/// chunk at a time on every worker, and glibc keeps the freed chunk buffers in
+/// the workers' arenas: about 200 MB on the osf-sa3x8 chain that no lease
+/// sees. Fixed, every buffer of a chunk's size or more is mapped and handed
+/// back when freed. (Two arenas did the same at half as much system time
+/// again.) Without a cap the allocator is left as it is.
+fn limit_heap_retention() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+        // SAFETY: `mallopt` only sets an allocator parameter; it is called
+        // before the worker pool exists.
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        }
+    }
+}
+
 fn main() {
     if cfg!(debug_assertions) {
         eprintln!("atlas-registration: use a release build (cargo run --release)");
         std::process::exit(2);
     }
     let cli = Cli::parse();
-    blockflow::budget::set_process_cap(blockflow::budget::MemoryCap::resolve(
-        cli.memory_mb.map(|mib| mib << 20),
-    ));
+    let cap = blockflow::budget::MemoryCap::resolve(cli.memory_mb.map(|mib| mib << 20));
+    if cap.is_binding() {
+        limit_heap_retention();
+    }
+    blockflow::budget::set_process_cap(cap);
     let result = match &cli.command {
         Command::Register(args) => run_register(args),
         Command::Chain(args) => run_chain(args),
         Command::TransformPoints(args) => run_points(args),
+        Command::Place(args) => run_place(args),
     };
     if let Err(error) = result {
         eprintln!("{error}");

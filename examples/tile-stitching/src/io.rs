@@ -34,7 +34,10 @@ use blockflow::zarr_env::PhysicalFrame;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::layout::{TileLayout, TileSource};
+use blockflow::Dtype;
+
+use crate::layout::{TileLayout, TileSource as LayoutSource};
+use crate::planned::{stored_chunk, TileSource};
 use crate::pyramid::{pyramid_factors, write_resident};
 use crate::wobbly::{source_status_name, status_name};
 use crate::{Aligned, Stitched};
@@ -122,7 +125,7 @@ impl TileSetFile {
             .tiles
             .iter()
             .zip(shapes)
-            .map(|(tile, &shape)| TileSource {
+            .map(|(tile, &shape)| LayoutSource {
                 shape,
                 tile_position: tile.grid.clone(),
             })
@@ -203,30 +206,43 @@ pub struct TileImage {
     pub unit: Option<String>,
 }
 
+/// One tile as stored: where its voxels are read from, and the metadata a
+/// [`TileImage`] carries, without reading a voxel.
+#[derive(Debug, Clone)]
+pub struct TileInfo {
+    /// The tile's level (its planes `z_range` when one is given).
+    pub source: TileSource,
+    /// The tile's extent, `[z, y, x]`, after `z_range`.
+    pub shape: [usize; 3],
+    pub dtype: Dtype,
+    pub voxel_size: [f64; 3],
+    pub translation: [f64; 3],
+    pub unit: Option<String>,
+}
+
 /// One tile: a channel of one level of an OME-Zarr image, optionally cropped
-/// to `z_range` (half-open, in level coordinates).
-pub fn read_tile(
+/// to `z_range` (half-open, in level coordinates), opened but not read.
+pub fn open_tile(
     path: &Path,
     channel: usize,
     level: usize,
     z_range: Option<(usize, usize)>,
-) -> Result<TileImage> {
+) -> Result<TileInfo> {
     let pyramid = OmeVolumePyramid::open(path, channel, 0)?;
     let image = pyramid.attached_level(level)?;
-    let (_, shape) = image.metadata()?;
-    let voxels = match z_range {
-        None => image.read()?,
-        Some((start, stop)) => {
-            if start >= stop || stop > shape[0] {
-                return Err(Error::invalid(format!(
-                    "z range {start}..{stop} is outside {}'s {} planes",
-                    path.display(),
-                    shape[0]
-                )));
-            }
-            image.read_region([start, 0, 0], [stop - start, shape[1], shape[2]])?
+    let (dtype, mut shape) = image.metadata()?;
+    let mut offset = [0usize; 3];
+    if let Some((start, stop)) = z_range {
+        if start >= stop || stop > shape[0] {
+            return Err(Error::invalid(format!(
+                "z range {start}..{stop} is outside {}'s {} planes",
+                path.display(),
+                shape[0]
+            )));
         }
-    };
+        offset[0] = start;
+        shape[0] = stop - start;
+    }
     let voxel_size = pyramid
         .levels()
         .get(level)
@@ -258,11 +274,44 @@ pub fn read_tile(
                 .find(|axis| axis["name"] == "x")
                 .and_then(|axis| axis["unit"].as_str().map(str::to_owned))
         });
-    Ok(TileImage {
-        voxels,
+    let level_path = &pyramid
+        .levels()
+        .get(level)
+        .ok_or_else(|| Error::invalid(format!("no level {level}")))?
+        .path;
+    let chunk = stored_chunk(pyramid.image_root(), level_path);
+    Ok(TileInfo {
+        source: TileSource {
+            image,
+            offset,
+            chunk,
+        },
+        shape,
+        dtype,
         voxel_size,
         translation,
         unit,
+    })
+}
+
+/// One tile: a channel of one level of an OME-Zarr image, optionally cropped
+/// to `z_range` (half-open, in level coordinates), read.
+pub fn read_tile(
+    path: &Path,
+    channel: usize,
+    level: usize,
+    z_range: Option<(usize, usize)>,
+) -> Result<TileImage> {
+    let info = open_tile(path, channel, level, z_range)?;
+    let voxels = info
+        .source
+        .image
+        .read_region(info.source.offset, info.shape)?;
+    Ok(TileImage {
+        voxels,
+        voxel_size: info.voxel_size,
+        translation: info.translation,
+        unit: info.unit,
     })
 }
 

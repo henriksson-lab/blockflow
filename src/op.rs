@@ -1111,6 +1111,19 @@ pub trait BlockOp: Send + Sync {
     fn device_bytes(&self, _block: [usize; 3]) -> Option<u64> {
         None
     }
+
+    /// The most blocks of this op that can usefully run at once, or `None` —
+    /// the default — for no limit beyond the workers and the memory cap.
+    ///
+    /// For an op whose blocks are serialised on something the host pool does
+    /// not see (one device, driven from one thread): `Some(1)` there tells the
+    /// planner to price the phase at one block in flight and the executor to
+    /// admit no more than that, rather than parking workers (and their memory)
+    /// in a queue for the device. A phase takes the least of its ops' limits
+    /// ([`Chain::max_in_flight`]).
+    fn max_in_flight(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// What joins the branches of a [`Chain::Parallel`] back into one result.
@@ -1880,6 +1893,23 @@ pub enum Chain {
 }
 
 impl Chain {
+    /// The least [`BlockOp::max_in_flight`] of the ops that run in this chain
+    /// (every branch of a `Parallel`, the taken branch of an `Alternative`),
+    /// or `None` when none limits it.
+    pub fn max_in_flight(&self) -> Option<usize> {
+        match self {
+            Chain::Op(op) => op.max_in_flight(),
+            Chain::Sequence(children)
+            | Chain::Parallel {
+                branches: children, ..
+            } => children.iter().filter_map(Chain::max_in_flight).min(),
+            Chain::Alternative { branches, taken } => {
+                branches.get(*taken).and_then(Chain::max_in_flight)
+            }
+            _ => None,
+        }
+    }
+
     /// A single op, boxed.
     pub fn op<T: BlockOp + 'static>(op: T) -> Chain {
         Chain::Op(Box::new(op))

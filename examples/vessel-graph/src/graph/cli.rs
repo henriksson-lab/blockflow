@@ -13,8 +13,8 @@
 //!    (`<name>-artery-mask`, `<name>-vein-mask`), `artery_raw` / `vein_raw`
 //!    from the raw channels when given;
 //! 2. atlas coordinates (`coordinates_atlas`): the graph's voxels mapped into
-//!    atlas voxels through a [`PointMap`] — the change of lattice onto an
-//!    atlas label already in the sample frame (`--annotation-label`), or,
+//!    atlas voxels through a [`super::PointMap`] — the change of lattice onto
+//!    an atlas label already in the sample frame (`--annotation-label`), or,
 //!    with `--registration`, onto the registration's sample and through its
 //!    point transform into a prepared atlas
 //!    (`blockflow_atlas_registration::atlas_space`), with the radii as
@@ -51,12 +51,16 @@ use serde_json::Value;
 use super::annotate::ATLAS_COORDINATES;
 use crate::profile::GRAPH;
 
-use super::planned::{PlanParams, StoredInputs};
-use super::tables::{write_graph_tables, GraphTables, TableGeometry};
+use super::planned::{
+    lease_resident, PlanParams, StoredInputs, ATLAS_BYTES_PER_VERTEX, GRAPH_BYTES_PER_VERTEX,
+};
+use super::tables::{
+    table_buffer_bytes, write_graph_tables_within, GraphTables, TableGeometry, TableMemory,
+};
 use super::vessel::Factors;
 use super::{
     annotate, branch_density, classify, vessel_graph_stored, Affine, BranchParams, ClassifyParams,
-    GraphParams, Lattice, PointMap,
+    GraphParams, Lattice,
 };
 
 /// `graph`: a published skeleton (and masks) to a vessel graph.
@@ -144,13 +148,14 @@ pub struct GraphArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// Block edge of the planned vertex measure (raw graph, radii, signals),
-    /// z,y,x. Does not change any result.
-    #[arg(long, value_delimiter = ',', default_values_t = vec![128, 256, 256])]
-    pub block: Vec<usize>,
-    /// Block edge of the planned narrowing of the published labels, z,y,x.
-    /// Does not change any result.
-    #[arg(long, value_delimiter = ',', default_values_t = vec![64, 64, 128])]
-    pub pack_block: Vec<usize>,
+    /// z,y,x (default: the grid the planner prices fastest under the memory
+    /// cap). Does not change any result.
+    #[arg(long, value_delimiter = ',')]
+    pub block: Option<Vec<usize>>,
+    /// Block edge of the planned narrowing of the published labels, z,y,x
+    /// (default: the planner's choice). Does not change any result.
+    #[arg(long, value_delimiter = ',')]
+    pub pack_block: Option<Vec<usize>>,
     /// Worker threads (default: one per core).
     #[arg(long)]
     pub workers: Option<usize>,
@@ -175,6 +180,14 @@ pub struct GraphSummary {
     /// With `--registration`: vertices mapped outside the atlas (region 0).
     pub atlas_outside: Option<usize>,
 }
+
+/// The least a table's row buffer is given, leased or not: a few thousand
+/// rows.
+const MIN_TABLE_BUFFER: u64 = 4 << 20;
+
+/// What the branch density holds per voxel of its lattice, leased while it
+/// is made and written.
+const DENSITY_BYTES_PER_VOXEL: u64 = 16;
 
 fn label_root(root: &Path, name: &str) -> PathBuf {
     root.join("labels").join(name)
@@ -386,10 +399,32 @@ pub(crate) fn write_density(
     lattice: Lattice,
     unit: &str,
 ) -> Result<()> {
+    write_narrowed(root, narrowed(voxels)?, lattice, unit)
+}
+
+/// [`write_density`] of a density let go once it is narrowed, so that the
+/// `f64` volume is not held while the image is written.
+pub(crate) fn write_density_from(
+    root: &Path,
+    voxels: Voxels,
+    lattice: Lattice,
+    unit: &str,
+) -> Result<()> {
+    let narrow = narrowed(&voxels)?;
+    drop(voxels);
+    write_narrowed(root, narrow, lattice, unit)
+}
+
+fn narrowed(voxels: &Voxels) -> Result<Voxels> {
+    Ok(Voxels::F32(
+        voxels.view::<f64>()?.mapv(|value| value as f32),
+    ))
+}
+
+fn write_narrowed(root: &Path, narrow: Voxels, lattice: Lattice, unit: &str) -> Result<()> {
     if root.exists() {
         std::fs::remove_dir_all(root).map_err(Error::backend)?;
     }
-    let narrow = Voxels::F32(voxels.view::<f64>()?.mapv(|value| value as f32));
     let shape = narrow.shape();
     let chunk = shape.map(|edge| edge.clamp(1, 128));
     let frame = PhysicalFrame::new(lattice.scale, Some(unit)).with_origin(lattice.translation);
@@ -466,17 +501,22 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
         largest_component: !args.all_components,
         ..GraphParams::default()
     };
+    let edge = |given: &Option<Vec<usize>>, flag: &str| -> Result<Option<[usize; 3]>> {
+        given
+            .as_deref()
+            .map(|block| {
+                block
+                    .try_into()
+                    .map_err(|_| Error::invalid(format!("{flag} needs three values, z,y,x")))
+            })
+            .transpose()
+    };
+    // The atlas columns (coordinates, region, hemisphere, distance to
+    // surface per polyline point) are what the graph grows by in atlas space.
+    let in_atlas = args.registration.is_some() || args.annotation_label.is_some();
     let plan = PlanParams {
-        block: args
-            .block
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::invalid("--block needs three values, z,y,x"))?,
-        pack_block: args
-            .pack_block
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::invalid("--pack-block needs three values, z,y,x"))?,
+        block: edge(&args.block, "--block")?,
+        pack_block: edge(&args.pack_block, "--pack-block")?,
         workers: args
             .workers
             .unwrap_or_else(rayon::current_num_threads)
@@ -491,6 +531,8 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
             args.zarr
                 .with_file_name(format!(".{name}.vessel-graph-graph-work"))
         }),
+        resident_bytes_per_vertex: GRAPH_BYTES_PER_VERTEX
+            + if in_atlas { ATLAS_BYTES_PER_VERTEX } else { 0 },
     };
     let mut graph = vessel_graph_stored(&inputs, &params, &plan)?;
     eprintln!(
@@ -518,8 +560,10 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
     if let Some(atlas) = &atlas {
         // The atlas is already in the sample frame, so the map from graph
         // voxels to atlas voxels is the change of lattice.
-        let to_atlas: Box<dyn PointMap> = Box::new(Affine::between(level0, atlas.lattice)?);
-        graph.transform_coordinates(ATLAS_COORDINATES, to_atlas.as_ref())?;
+        graph.transform_coordinates_affine(
+            ATLAS_COORDINATES,
+            Affine::between(level0, atlas.lattice)?,
+        )?;
         annotate(&mut graph, &annotator(args)?, atlas.volumes())?;
     }
     let mut atlas_outside = None;
@@ -586,9 +630,9 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
                     ))
                 })?;
                 let lattice = level_lattice(chosen);
-                graph.transform_coordinates(
+                graph.transform_coordinates_affine(
                     "coordinates_density",
-                    &Affine::between(level0, lattice)?,
+                    Affine::between(level0, lattice)?,
                 )?;
                 (lattice, chosen.shape, "coordinates_density")
             }
@@ -598,8 +642,16 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
             radius,
             ..BranchParams::default()
         };
+        // The density in `f64`, its `f32` copy and the image written from
+        // it, the `f64` let go before the writing: 12.5 bytes a voxel at its
+        // widest on the osf-sa3x8 crop.
+        let voxels = density_shape.iter().product::<usize>() as u64;
+        let _lease = lease_resident(
+            voxels.saturating_mul(DENSITY_BYTES_PER_VOXEL),
+            &format!("the branch density of {density_shape:?} voxels"),
+        )?;
         let (density, outside) = branch_density(&graph, density_shape, &params)?;
-        write_density(path, &density, lattice, &unit)?;
+        write_density_from(path, density, lattice, &unit)?;
         density_outside = Some(outside);
     }
 
@@ -616,12 +668,30 @@ pub fn run_graph(args: &GraphArgs) -> Result<GraphSummary> {
                     .as_ref()
                     .map(|(registered, _)| registered.describe()),
             };
-            Some(write_graph_tables(
+            // Each table's rows are buffered in what the budget has free (up
+            // to all of them), and spilled as sorted runs past it.
+            let budget = blockflow::budget::process_budget();
+            let wanted = table_buffer_bytes(&graph);
+            let lease = budget.try_acquire_reclaiming(wanted).or_else(|| {
+                let free = budget.free().max(MIN_TABLE_BUFFER);
+                budget.try_acquire_reclaiming(free.min(wanted))
+            });
+            let memory = TableMemory {
+                buffer_bytes: lease.as_ref().map_or(MIN_TABLE_BUFFER, |lease| {
+                    lease.bytes().max(MIN_TABLE_BUFFER)
+                }),
+                temporary: Some(plan.work.join("tables")),
+            };
+            let written = write_graph_tables_within(
                 &graph,
                 &root.join("tables"),
                 &args.name,
                 &geometry,
-            )?)
+                &memory,
+            )?;
+            drop(lease);
+            let _ = std::fs::remove_dir_all(&plan.work);
+            Some(written)
         }
     };
     if let Some(path) = &args.out {

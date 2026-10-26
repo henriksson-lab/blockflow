@@ -170,6 +170,10 @@ target/release/atlas-registration chain \
     --parameters 0=$A/align_affine.txt \
     --parameters 1=$A/align_affine.txt --parameters 1=$A/align_bspline.txt
 
+# where a part of a mosaic lies in its autofluorescence (no fit)
+target/release/atlas-registration place \
+    --fixed signal.zarr --moving autofluorescence.zarr --resolution 25 --out place.json
+
 target/release/atlas-registration transform-points \
     --registration chain/ --input cells.csv --output cells_atlas.csv \
     --columns centroid_z,centroid_y,centroid_x          # add --inverse for atlas -> sample
@@ -185,6 +189,40 @@ over 50 iterations changes by less than this fraction; elastix has no such test
 and runs every iteration), `--warped-stages` (write the moving image warped
 after each stage).
 
+### Memory cap
+
+`--memory-mb` (any subcommand; else `$BLOCKFLOW_MEMORY_CAP`, else the
+cgroup's limit, else a share of the machine). The registration's volumes are
+not planned, but each is leased from the process's budget
+(`blockflow::budget::process_budget`, through `memory::lease`) before it is
+allocated and given back once it is freed: both lattices in `float64` for the
+whole step, the fit's `float32` copies and each stage's smoothed copies of
+them, each image read whole (as stored and widened) while it is resampled or
+warped, each stage's warped image, the placement search's pyramids and
+correlations, and a prepared atlas opened with `RegisteredAtlas` (its volumes
+as stored, for as long as it is held). Under a stated or cgroup cap a lease
+that does not fit stops the run, naming what needed it and the cap that would
+hold it; under the machine's own share it is a warning. Under a binding cap
+the allocator maps every buffer of 1 MiB or more, so freed chunk buffers go
+back to the system rather than staying in the workers' heaps.
+
+Measured 2026-10-23 on the osf-sa3x8 chain of the lightsheet pipeline
+(stitched signal → autofluorescence → ABA 2017 25 µm, `--initialise
+0=search`, 40 threads, load 32–50), before and after alternated; wall s / CPU
+s / peak RSS:
+
+| | before | after |
+|---|---|---|
+| uncapped | 84 / 1190 / 2376 MiB; 88 / 1198 / 2347 MiB | 81 / 1181 / 1422 MiB; 89 / 1180 / 1422 MiB |
+| `--memory-mb 1280` | | 95 / 1205 / 1201 MiB |
+| cgroup `MemoryMax=1280M` | | 104 / 1233 / 1199 MiB |
+| `--memory-mb 1024` | | refused in step 1, naming the resampling read |
+
+The transform files and `registration.json` (timings aside) are the same in
+every run. The peak fell because the lattice warp writes its planes straight
+into the output a row at a time: it used to collect slabs and then copy them,
+with three `float64` coordinate volumes per slab on every worker.
+
 ### Initialisation
 
 Where the first stage starts, i.e. where the moving image is taken to lie
@@ -197,6 +235,7 @@ later stages start from the stages before them):
 | `--initialise physical` | `--initialise K=physical` | the two images' physical frames as they stand | `AutomaticTransformInitialization "false"` |
 | `--initialise centre` | `--initialise K=centre` | the fixed image's geometric centre on the moving image's | `"true"` with `AutomaticTransformInitializationMethod "GeometricalCenter"` |
 | `--initial-translation Z,Y,X` | `--initial-translation K=Z,Y,X` | the physical frames, the fixed image moved by `t`: its point `p` starts at the moving image's `p + t` (the images' unit) | `-t0` with a translation transform, except that here `t` is the first stage's starting value, fitted with it and written into its file |
+| `--initialise search` | `--initialise K=search` | as `--initial-translation`, with the `t` a placement search finds on the two lattices (below) | none |
 
 The reference's `align_affine.txt` says `"true"`, so by default a registration
 starts from the centres. That places a whole sample in its atlas, or a whole
@@ -206,7 +245,39 @@ positions, an autofluorescence image with its own), `physical` starts it
 there; when they do not, `--initial-translation` does. An initialisation other
 than `parameters` applies to stochastic stages only, and a translation needs a
 translation or affine first stage. `registration.json` records it
-(`initialisation`).
+(`initialisation`; for a search, the whole search under `search`, and its
+time as `timings.place_s`). `--initial-translation` overrides a search.
+
+### Placement search
+
+`--initialise search`, or `atlas-registration place --fixed F --moving M
+--resolution 25 [--out place.json]` on its own (`pipeline::place`,
+`place::search_translation`), finds where the fixed image lies in the moving
+one, translation only, on the lattices the fit uses:
+
+1. **Pyramid**: 2x block means of both lattices, down to where the fixed
+   image is still 16 voxels across on every axis (at most 8x the lattice;
+   `--search-levels` to choose), intensities as `ln(1 + v)` (`--search-linear`
+   to keep them).
+2. **Exhaustive at the coarsest level**: the masked normalised
+   cross-correlation at every integer translation that overlaps at least half
+   of the smaller image (`--search-min-overlap`), from six FFT correlations
+   (`ops::fft::RealTransform3`): box, image and squared image of each side,
+   so means and variances are the overlap's own. The working set is bounded
+   (1 GiB, a quarter of the memory cap, or what the cap leaves beside the
+   volumes already held, whichever is least; coarser if needed) and leased
+   from the process budget, as are the two pyramids.
+3. **Candidates**: the 8 best local maxima, each refined level by level by
+   hill-climbing the NCC from where the level above put it; candidates 0.15
+   below the best are dropped, ones that meet are merged; a parabola per
+   axis gives the sub-voxel peak at the lattice.
+4. **Verdict**: refused when the best NCC is below 0.2
+   (`--search-min-peak`), or when a distinct runner-up comes within 0.05
+   (`--search-min-margin`) at the finest level that still compared one, with
+   the candidates listed and a pointer to `--initial-translation`.
+
+Rotation and scale are left to the fit, so on real pairs whose frames differ
+by a few per cent in scale the peak NCC is well below 1.
 
 ## Output
 
@@ -230,6 +301,25 @@ translation or affine first stage. `registration.json` records it
 Release build, `cargo test --release -p blockflow-atlas-registration`; the
 `ops::align` kernels in `cargo test --release --features zarr --lib ops::align`.
 
+**Placement search**: `place`'s unit tests (the FFT field against the direct
+NCC at every tested shift to 1e-6; a crop found within a quarter voxel; two
+identical copies refused as ambiguous; an unrelated pattern refused), and in
+`tests/register_stochastic.rs` the unplaced strip below found within a voxel
+and registered within a quarter of a moving voxel from it. On real data
+(`tests/real_placement.rs`, ignored; 25 µm lattices, load 30-50 on 40 cores):
+
+| pair | found (µm) | independent | NCC / margin | search |
+|---|---|---|---|---|
+| osf-sa3x8 nine-tile strip in its autofluorescence | (-11, 3404, 4541) | (0, 3420, 4535) by hand (NCC at 50 / 30 µm) | 0.558 / 0.20 | 1.0-4.3 s |
+| osf-cztq2 whole mosaic in its autofluorescence | (247, 135, -369) | — | 0.712 / 0.39 | 1.8-2.2 s |
+
+The osf-sa3x8 chain from the found translation and from the hand one put the
+vessel graph's vertices a median 3 µm apart in the atlas (lightsheet-pipeline
+README). On osf-cztq2 the affine started from the search equals the one
+started from the centres (the reference file's default) to 1e-10 in every
+parameter; outputs of the other initialisations are unchanged by the search
+code (the same transform files, to the bit).
+
 **Initialisation** (`tests/register_stochastic.rs`, a strip near one side of a
 field twice the scene's size): each mode starts where it says, to 1e-6
 voxels (the physical frames; the centres on each other; the frames moved by
@@ -237,7 +327,7 @@ the translation given), and from the frames, or from a translation 3 µm off
 on every axis, the fit lands within a quarter of a moving voxel. On
 osf-sa3x8's nine-tile strip in its autofluorescence (lightsheet-pipeline
 README) the centres collapse the affine and the frames do not overlap; the
-measured translation registers it.
+measured or searched translation registers it.
 
 **Against the reference's elastix run** (`reference-clearmap/`, full numbers
 in its README): osf-cztq2 autofluorescence resampled to 25 µm (248 × 478 × 285)
@@ -291,7 +381,8 @@ against 11.12 for not registering at all.
   independently in numpy). elastix's estimator is the same one; on the real
   atlas pair the native and elastix results agree to the noise above.
 - **Stochastic fit, not planned.** Both lattices are held in memory (an atlas
-  at 25 µm is tens of millions of voxels, about 1 GB with its pyramid level);
+  at 25 µm is tens of millions of voxels, about 1.1 GB with the fit's copies
+  on the osf-sa3x8 chain), leased under the cap but not made smaller by it;
   each iteration's samples are split into a fixed number of chunks evaluated in
   parallel and reduced in order.
 - **Not implemented** (refused by name): masks, multi-metric registration,

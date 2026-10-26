@@ -1559,6 +1559,22 @@ pub trait FragmentOp: Send + Sync {
         Vec::new()
     }
 
+    /// Bytes this op allocates while it applies one block whose read extent is
+    /// `read`, **beyond** the buffers the plan already counts for the phase
+    /// (its input, its source images and its output, at the widest element
+    /// width among them): widened copies, per-voxel temporaries, decoded
+    /// fragments.
+    ///
+    /// Added to what a block of the phase is charged against a memory cap
+    /// (`strategy::price_under_budget` and the executor's admission). An op
+    /// that holds a few `f64` volumes per block and says nothing is charged
+    /// for `u16` ones, and runs as many blocks at once as that figure allows.
+    /// `0`, the default, is honest for an op whose temporaries are a few
+    /// fragments' worth.
+    fn scratch_bytes(&self, _read: [usize; 3]) -> u64 {
+        0
+    }
+
     /// The value most of the image this op writes holds, if it writes pixels
     /// and knows: a painter of labels says `Some(0.0)`. See
     /// [`PhaseDecomposition::background`](crate::decomposition::PhaseDecomposition::background)
@@ -2687,6 +2703,60 @@ pub fn fold_fragments(
     Ok(seen)
 }
 
+/// Disable runtime preparation while preserving the same kernel and static plan.
+/// Useful for dense-reference validation and measurements.
+pub struct Unprepared<O>(pub O);
+impl<O: FragmentOp> FragmentOp for Unprepared<O> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn reach(&self, a: usize, n: usize) -> usize {
+        self.0.reach(a, n)
+    }
+    fn cost_per_voxel(&self) -> f64 {
+        self.0.cost_per_voxel()
+    }
+    fn reads_pixels(&self) -> bool {
+        self.0.reads_pixels()
+    }
+    fn writes_pixels(&self) -> bool {
+        self.0.writes_pixels()
+    }
+    fn produces(&self, d: Dtype) -> Dtype {
+        self.0.produces(d)
+    }
+    fn source_inputs(&self, v: [usize; 3]) -> Vec<SourceInput> {
+        self.0.source_inputs(v)
+    }
+    fn inputs(&self) -> Vec<FragmentInput> {
+        self.0.inputs()
+    }
+    fn outputs(&self) -> Vec<FragmentOutput> {
+        self.0.outputs()
+    }
+    fn barrier(&self) -> bool {
+        self.0.barrier()
+    }
+    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
+        self.0.reduce(at)
+    }
+    fn gathers(&self) -> bool {
+        self.0.gathers()
+    }
+    fn background(&self) -> Option<f64> {
+        self.0.background()
+    }
+    fn seam_fold(&self) -> Option<SeamFold> {
+        self.0.seam_fold()
+    }
+    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
+        self.0.apply(at)
+    }
+    fn apply_with(&self, at: &BlockView<'_>, s: SourceBlocks<'_>) -> Result<BlockOutput> {
+        self.0.apply_with(at, s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2897,59 +2967,5 @@ mod tests {
         assert_eq!(packed.len(), 32);
         assert_eq!(unpack_u64(&packed).unwrap(), vec![1, 2, 3, u64::MAX]);
         assert!(unpack_u64(&packed[..31]).is_err());
-    }
-}
-
-/// Disable runtime preparation while preserving the same kernel and static plan.
-/// Useful for dense-reference validation and measurements.
-pub struct Unprepared<O>(pub O);
-impl<O: FragmentOp> FragmentOp for Unprepared<O> {
-    fn name(&self) -> &'static str {
-        self.0.name()
-    }
-    fn reach(&self, a: usize, n: usize) -> usize {
-        self.0.reach(a, n)
-    }
-    fn cost_per_voxel(&self) -> f64 {
-        self.0.cost_per_voxel()
-    }
-    fn reads_pixels(&self) -> bool {
-        self.0.reads_pixels()
-    }
-    fn writes_pixels(&self) -> bool {
-        self.0.writes_pixels()
-    }
-    fn produces(&self, d: Dtype) -> Dtype {
-        self.0.produces(d)
-    }
-    fn source_inputs(&self, v: [usize; 3]) -> Vec<SourceInput> {
-        self.0.source_inputs(v)
-    }
-    fn inputs(&self) -> Vec<FragmentInput> {
-        self.0.inputs()
-    }
-    fn outputs(&self) -> Vec<FragmentOutput> {
-        self.0.outputs()
-    }
-    fn barrier(&self) -> bool {
-        self.0.barrier()
-    }
-    fn reduce(&self, at: &PhaseView<'_>) -> Result<Vec<u8>> {
-        self.0.reduce(at)
-    }
-    fn gathers(&self) -> bool {
-        self.0.gathers()
-    }
-    fn background(&self) -> Option<f64> {
-        self.0.background()
-    }
-    fn seam_fold(&self) -> Option<SeamFold> {
-        self.0.seam_fold()
-    }
-    fn apply(&self, at: &BlockView<'_>) -> Result<BlockOutput> {
-        self.0.apply(at)
-    }
-    fn apply_with(&self, at: &BlockView<'_>, s: SourceBlocks<'_>) -> Result<BlockOutput> {
-        self.0.apply_with(at, s)
     }
 }

@@ -95,7 +95,7 @@ pub struct SeriesGeometry {
 
 impl SeriesGeometry {
     pub fn new(extent: [usize; 3], spacing: [f64; 3]) -> Result<Self> {
-        if extent.iter().any(|&n| n == 0) {
+        if extent.contains(&0) {
             return Err(Error::invalid(format!(
                 "series extent {extent:?} has an empty axis"
             )));

@@ -11,7 +11,7 @@ use std::path::Path;
 
 use blockflow::region::Region;
 use blockflow::voxels::Voxels;
-use blockflow::zarr_env::{chunk_for_block, PhysicalFrame, PyramidSpec, ZarrEnvironment};
+use blockflow::zarr_env::{chunk_for_extent, PhysicalFrame, PyramidSpec, ZarrEnvironment};
 use blockflow::Dtype;
 use ndarray::{Array3, Axis};
 use serde_json::json;
@@ -325,7 +325,7 @@ fn the_slab_writer_writes_what_build_multiscale_writes() {
             let mut writer =
                 PyramidWriter::<u16>::create(&uneven, shape, &factors, axis, Some(frame.clone()))
                     .expect("a writer");
-            assert_eq!(writer.chunk(), chunk_for_block(shape, dtype));
+            assert_eq!(writer.chunk(), chunk_for_extent(shape, dtype));
             let (mut at, mut step) = (0, 1);
             while at < shape[axis] {
                 let stop = (at + step).min(shape[axis]);

@@ -13,7 +13,9 @@ tiles + grid + nominal overlap
   layout   nominal positions from the grid                     src/layout.rs
   rigid    per neighbouring pair: max-project the facing ends  src/rigid.rs
            (depth = nominal overlap), mean squared difference
-           over every shift via blockflow::ops::fft
+           over every shift via blockflow::ops::fft; each pair
+           reads its two facing slabs, or with them the boxes
+           the per-slice step will cut, kept (src/tiles.rs)
   layout   least squares over the pair graph -> one position   src/layout.rs
            per tile, lowered to the origin
   wobbly   per pair and slice of the overlap: landscape over   src/wobbly.rs
@@ -26,10 +28,11 @@ tiles + grid + nominal overlap
            between slices; smoothing
   fuse     per output voxel: weighted mean of the covering     src/fuse.rs
            tiles, weight = 1 + distance to the tile's nearest
-           in-plane face; blocks in parallel on a BlockGrid
-           (resident tiles), or planned slab by slab from      src/planned.rs
-           the tiles on disk (--layout-from)
-  write    multiscale OME-Zarr, slab by slab, chunk-parallel   src/pyramid.rs
+           in-plane face; planned slab by slab, chunks in      src/planned.rs
+           parallel, over views of resident tiles or boxes
+           read from the tiles on disk (the CLI, after
+           alignment or with --layout-from)
+  write    multiscale OME-Zarr, slab by slab, chunk-parallel   blockflow::zarr_env::MultiscaleWriter
 ```
 
 The rigid step corrects only the axes transverse to the tiling axis (the
@@ -38,8 +41,15 @@ including the tiling axis. Volumes are `(z, y, x)`, tiled in x and y, wobbling
 along z; every module takes the axes as parameters.
 
 The library API is `tile_stitching::stitch(tiles, layout, params)`, with the
-steps also available one by one (`align_rigid`, `measure_wobbly`, `place_wobbly`,
-`wobbly::measure_layout`, `place::place_layout`, `fuse::resident`).
+steps also available one by one (`align`, `align_rigid`, `measure_wobbly`,
+`place_wobbly`, `wobbly::measure_layout`, `place::place_layout`,
+`fuse::resident`). For tiles left on disk it is `align_stored` (on
+`tiles::StoredTiles`) and `planned::fuse_to_pyramid`, which the CLI runs. Both
+paths run the same code under the memory cap (see [Memory](#memory)): the
+alignment reads boxes from `tiles::TileBoxes` (views of resident tiles, or
+boxes read from stored ones) and the fusion is the planned one over the same
+boxes, so `fuse::resident` holds only the volume it returns and one slab
+beside the tiles it was given.
 
 ## Input
 
@@ -155,19 +165,21 @@ read, each tile's box for the region is known: the planes usable there and,
 per plane, the in-plane part inside the region at that plane's own
 position. The region is cut into slabs of whole output chunk rows along the
 axis the output's chunks cut most often (`pyramid::sweep_axis`; for
-osf-cztq2 at level 2, whose chunks are `1043 x 1 x 1142`, that is y). Each
+osf-cztq2 at level 2, whose chunks are `149 x 76 x 143`, that is y). Each
 tile is held as one buffer covering what the current slab needs. The next
 slab keeps the rows still needed and reads the rest up to the tile's next
-stored chunk boundary, so every stored tile chunk is decoded once. The next
+stored chunk boundary, so every stored tile chunk is decoded once; a tile's
+buffer is dropped once no later slab needs it. The next
 slab's reads overlap the current slab's fusion and writing. A slab's chunks
 are fused in parallel by the same kernel as the resident fusion, which reads
 the same tile voxels in the same order, so the output is identical. Each
 finished slab goes straight to the pyramid writer (`src/pyramid.rs`). As soon
 as a level has a whole row of chunks, the writer encodes and stores it, chunk
 by chunk in parallel. As soon as the windows for the next level's rows are
-present, it computes those rows. No level is ever read back. The arrays and
-metadata are byte for byte those `ZarrEnvironment::build_multiscale` writes
-for the resident volume.
+present, it computes those rows. No level is ever read back. The writer is
+core's (`blockflow::zarr_env::MultiscaleWriter`, the one behind
+`ZarrEnvironment::build_multiscale`), so the image is the one
+`build_multiscale` writes for the resident volume.
 
 There is no automatic choice between this and a resident fusion, because the
 planned path is the faster one at every size measured, a 512^3-voxel box
@@ -200,9 +212,38 @@ START:STOP`, `--max-shift Y,X` (per-slice search, default `15,30`),
 `--rigid-max-shift Y,X` (rigid in-plane search, default `30,30`),
 `--max-shift-z` (rigid search along z, default 20), `--slice-step` (measure
 every N-th slice, default 3), `--rigid-only`, `--fuse
-interpolation|mean|max|min`, `--out-levels`, `--positions`. Both in-plane
-range options also take one value for both axes; ranges are in voxels either
-side.
+interpolation|mean|max|min`, `--out-levels`, `--positions`, `--memory-mb`
+(see [Memory](#memory)). Both in-plane range options also take one value for
+both axes; ranges are in voxels either side.
+
+### Memory
+
+The memory cap is `--memory-mb`, else `$BLOCKFLOW_MEMORY_CAP`, else the
+cgroup's limit, else a share of the machine (`blockflow::budget`; the first
+stderr line says which). The CLI never holds a tile whole. The alignment
+reads boxes (`src/tiles.rs`): a rigid pair its two facing slabs, a per-slice
+pair the two boxes its overlap cuts span, in the tiles' own element type,
+widening one plane at a time while it measures. The two overlap: for narrow
+tiles (osf-sa3x8 is 202 voxels across x) the cuts take most of the slabs'
+stored chunks. So the rigid step reads, for each pair it can, the bounding box
+of its slabs and of the cuts the per-slice step will take at any rigid
+position within its search range (plus two voxels; a pair placed further is
+read again), where that decodes fewer stored chunks than reading the two
+apart, projects its slabs from it, and keeps it, leased from the budget, until
+the per-slice step has measured that pair. What is kept is at most three
+quarters of what the per-slice step's boxes take with a pair on every worker,
+and half the cap. A rigid pair that keeps nothing reads its slabs a few stored
+chunk rows at a time. Pairs run in parallel, each
+holding a lease of what it will hold from the process budget, so as many run
+at once as the cap leaves room for (and never more than holding every tile
+would take); one pair is the least a run can hold. The fusion, after the
+alignment or with `--layout-from`, is the planned one (below): its slabs are
+sized so that a slab's tile buffers and fused rows take at most half of what
+the cap leaves, its tile buffers lease from the budget while held, and the
+pyramid writer encodes as many chunks at once as the cap leaves room for.
+Under a binding cap the allocator's mmap threshold is fixed at 4 MiB, so the
+large buffers it frees are handed back rather than kept in its arenas. The
+results do not depend on the cap.
 
 The search defaults are the reference's shipped ones (ClearMap 3.1's
 `config/defaults/v3.1/stitching.yml`): rigid +-30 in x and y and +-20 in z;
@@ -308,22 +349,61 @@ positions identical; per-slice measurements identical in 919 of 921 aligned
 slices; seam offsets within a voxel in 97% (y) and 93% (x) of planes, median
 0; fused Pearson r 0.99.
 
+Measured 2026-10-22 (machine load 10-45, so wall times are approximate):
+before is the CLI that held every tile, and after the alignment the fused
+volume. Positions are byte for byte those of before in every run, and every
+fused image has the same voxels in every level (its chunks are
+`chunk_for_extent`'s now, see Limitations).
+
+| run | wall | user+sys | peak RSS |
+|---|---|---|---|
+| osf-cztq2, 40 tiles, level 1, `--positions-only` | 254 -> 22 s | 388 -> 374-382 s | 21.3 -> 6.8-7.7 GB |
+| the same, `--memory-mb 4096` | 28 s | 364 s | 3.2 GB |
+| osf-sa3x8, 9 tiles, level 1, `--positions-only` | 28-35 -> 10 s | 66-70 -> 79-82 s | 4.8 -> 2.1-2.4 GB |
+| osf-sa3x8, level 1, align and fuse | 97-130 -> 23 s | 343-363 -> 308 s | 8.2 -> 3.2 GB |
+| the same, `--memory-mb 2048` (and under a 2048 MiB cgroup) | 25-26 s | 332-337 s | 1.9 GB |
+| osf-cztq2, level 2, align and fuse | 83 -> 47 s | 419 -> 426 s | 9.9 -> 5.0 GB |
+| osf-cztq2, level 2, `--layout-from` | 49 -> 23 s | 348 -> 303 s | 5.1 -> 3.0 GB |
+| the same, `--memory-mb 2048` | 28 s | 354 s | 1.2 GB |
+| osf-sa3x8, level 1, `--layout-from` | 39 -> 23 s | 322 -> 224 s | 2.6 -> 3.1 GB |
+
+Measured 2026-10-23 (load 5-35), alternating runs: before is HEAD, round 3
+the table above, after adds the shared reads, the pieced rigid slabs, one-row
+fused slabs fused in place, and the writer's held-row and resident-volume
+changes. Positions are byte for byte those of before; fused images are byte
+for byte those of round 3, and the same voxels as before.
+
+| run | wall (before / round 3 / after) | user+sys | peak RSS |
+|---|---|---|---|
+| osf-sa3x8, level 1, `--positions-only` | 25 / 6.0 / 4.1 s | 75 / 84 / 64 s | 4.8 / 2.2-2.4 / 1.9-2.0 GB |
+| osf-cztq2, level 1, `--positions-only` | 183 / 20-23 / 17-19 s | 394 / 365-376 / 283-287 s | 21.3 / 7.3-8.0 / 6.5-7.0 GB |
+| the same, `--memory-mb 4096` | - / 26-28 / 22-24 s | - / 378 / 321-331 s | - / 3.2-3.3 / 2.8 GB |
+| osf-sa3x8, level 1, `--layout-from` | 31-61 / 16-19 / 14-16 s | 338 / 226 / 223 s | 2.6-2.9 / 3.1 / 1.9 GB |
+| osf-sa3x8, level 1, align and fuse | 54 / 22 / 18 s | 368 / 309 / 288 s | 8.2 / 3.2 / 2.0 GB |
+| the same, `--memory-mb 2048` | - / 24-25 / 19 s | - / 337 / 305 s | - / 1.9 / 1.6 GB |
+| osf-cztq2, level 2, `--layout-from` | 28-34 / 22 / 20 s | 356 / 305 / 293 s | 5.1 / 3.0 / 2.3 GB |
+| the same, `--memory-mb 2048` | - / 27 / 23-25 s | - / 357 / 343 s | - / 1.22 / 1.18 GB |
+| osf-cztq2, level 2, align and fuse | 66 / 31-32 / 27 s | 407 / 426 / 403 s | 9.9 / 4.9 / 4.1-4.2 GB |
+
+The osf-sa3x8 fusion had a higher peak in round 3 because a slab was two
+rows of its 141-plane output chunks. It is one row now: a slab holds every
+tile's rows for it, so one row is half the tile buffers (two rows held 3.0
+GB).
+
 ## Limitations
 
-- Alignment is resident: every tile (or its `--z-range`) and, without
-  `--positions-only`, the fused volume are held in memory. For a whole
-  sample, align at a coarser level with `--positions-only` and fuse with
-  `--layout-from`, which is planned and holds only a slab's tile boxes and
-  output (see [Reusing a layout](#reusing-a-layout---layout-from));
-  osf-cztq2's 40 tiles at level 1 peak at about 40 GB in the alignment.
+- A per-slice pair holds both of its overlap boxes, whole, in the tiles'
+  element type while it is measured (the stack's mean and norm need every
+  plane twice), so one pair is the least the alignment holds: about 3 GB for
+  osf-cztq2 at level 1. A cap under that runs one pair at a time over it.
 - The planned fusion is planned here, not through a `blockflow` plan. A
   phase's supplied inputs must share the plan's volume and lattice, and each
   tile has its own shape and sits at its own translation in every plane.
-- The output's chunks are `zarr_env::chunk_for_block`'s. For a prime extent
-  (osf-cztq2's 1811 rows at level 2) that gives one-row chunks spanning the
-  other two axes. That is kept so the output stays identical to what came
-  before. It makes slabs whole-z, so a tile buffer holds every plane of its
-  rows.
+- The output's chunks are `zarr_env::chunk_for_extent`'s (2026-10-22): a
+  prime extent is halved rather than cut to one row, so osf-cztq2 at level 2
+  is chunked `149 x 76 x 143` instead of `1043 x 1 x 1142`. The voxels are
+  those of before; the chunk files are not. A fused slab is at least one row
+  of output chunks (as few rows as give every worker a chunk to fuse).
 - The rigid step does not correct the tiling axis; that is left to the
   per-slice step, so `--rigid-only` keeps the nominal spacing along it.
 - The whole-stack placement is a dense solve with one unknown per tile cluster

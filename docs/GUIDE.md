@@ -394,10 +394,12 @@ would do when no candidate's block fits. What the cap leaves for the cache is
 a **cost**: halo re-reads that would not fit are charged again. The caches
 (`ZarrEnvironment` default and `with_cache`) lease from the same
 `budget::process_budget()`, so they hold what the blocks leave and evict when
-a wave needs more. The executor admits each wave against that budget
-(`Hints::memory`, on by default): the first wave of a phase at the charged
-figure (`strategy::active_bytes_per_block`, with the op margin), later waves
-at what a wave of that phase alone was measured to hold, never under the
+the blocks need more. The executor admits blocks against that budget as room
+frees (`Hints::memory`, on by default): a block starts as soon as one
+finishes and its charge fits, never waiting for a wave. A phase starts at the
+charged figure (`strategy::active_bytes_per_block`, with the op margin); a
+phase near the cap is first measured from a moment with nothing in flight,
+its first blocks alone, and is then charged what they held, never under the
 margin-free figure (resident-set sampling, only near the cap).
 
 **Costs that are easy to miss:**

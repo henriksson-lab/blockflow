@@ -49,11 +49,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use atlas_regions::atlas_zarr::{open_prepared_atlas, read_volume, PreparedAtlas};
+use atlas_regions::atlas_zarr::{
+    open_prepared_atlas, read_volume, PreparedAtlas, ANNOTATION_LABEL, DISTANCE_TO_SURFACE,
+    HEMISPHERES_LABEL,
+};
 use atlas_regions::{
     distance_to_surface, label_at, voxel_index, AnnotateParams, Annotator, AtlasVolumes,
     OntologyLevel, OutOfBounds, Rounding,
 };
+use blockflow::budget::Lease;
 use blockflow::error::{Error, Result};
 use blockflow::geometry::BlockGrid;
 use blockflow::ops::distance::DistanceParams;
@@ -64,6 +68,7 @@ use blockflow::voxels::Voxels;
 use ndarray::Array3;
 use serde_json::{json, Value};
 
+use crate::memory;
 use crate::points::RegisteredImage;
 use crate::rescale::Frame;
 use crate::PointTransform;
@@ -293,6 +298,10 @@ pub struct RegisteredAtlas {
     /// The prepared atlas's own level-0 frame, for images written on its grid.
     pub atlas_image: ImageFrame,
     distance_voxels: Voxels,
+    /// The resident volumes' bytes, leased from the process's memory budget
+    /// for as long as this (or a clone, which shares it) is alive. A clone
+    /// copies the volumes without leasing the copy.
+    lease: Option<Arc<Lease>>,
 }
 
 impl RegisteredAtlas {
@@ -318,6 +327,19 @@ impl RegisteredAtlas {
                 }
             },
         };
+        // The volumes are leased, as stored, before they are read; a distance
+        // to the surface the atlas lacks is computed in float64.
+        let stored = prepared_atlas_bytes(&atlas_root)?;
+        let computed_distance = if stored.distance == 0 {
+            8 * memory::voxels(moving.shape)
+        } else {
+            0
+        };
+        let lease = memory::lease(
+            stored.total() + computed_distance,
+            &format!("the prepared atlas {}", atlas_root.display()),
+        )?
+        .map(Arc::new);
         let mut atlas = open_prepared_atlas(&atlas_root, OntologyLevel::TreeDepth)?;
         let shape = atlas.stack.annotation.shape();
         if shape != moving.shape {
@@ -359,6 +381,12 @@ impl RegisteredAtlas {
                         atlas_root.display()
                     )));
                 }
+                // Beside the output: the mask, and the transform's own
+                // float64 field.
+                let _computing = memory::lease(
+                    9 * memory::voxels(shape),
+                    "the atlas's distance to the surface, computed",
+                )?;
                 distance_to_surface(&atlas.stack.annotation, &DistanceParams::default())?
             }
         };
@@ -369,7 +397,14 @@ impl RegisteredAtlas {
             atlas,
             atlas_image,
             distance_voxels,
+            lease,
         })
+    }
+
+    /// The bytes leased for the resident volumes (`None` when the budget
+    /// could not grant them and no binding cap was stated).
+    pub fn leased_bytes(&self) -> Option<u64> {
+        self.lease.as_ref().map(|lease| lease.bytes())
     }
 
     /// The registration's sample, its first fixed image.
@@ -611,6 +646,40 @@ impl RegisteredAtlas {
     }
 }
 
+/// A prepared atlas's level-0 volumes, bytes as stored.
+struct PreparedBytes {
+    reference: u64,
+    annotation: u64,
+    hemispheres: u64,
+    distance: u64,
+}
+
+impl PreparedBytes {
+    fn total(&self) -> u64 {
+        self.reference + self.annotation + self.hemispheres + self.distance
+    }
+}
+
+/// What `open_prepared_atlas` will hold resident for the atlas at `root`.
+fn prepared_atlas_bytes(root: &Path) -> Result<PreparedBytes> {
+    let level0 = |path: PathBuf| -> Result<u64> {
+        if !path.join("zarr.json").is_file() {
+            return Ok(0);
+        }
+        let (dtype, shape) = blockflow::ome_zarr::OmeVolumePyramid::open(&path, 0, 0)?
+            .attached_level(0)?
+            .metadata()?;
+        Ok(memory::voxels(shape) * dtype.size_of() as u64)
+    };
+    let labels = root.join("labels");
+    Ok(PreparedBytes {
+        reference: level0(root.to_path_buf())?,
+        annotation: level0(labels.join(ANNOTATION_LABEL))?,
+        hemispheres: level0(labels.join(HEMISPHERES_LABEL))?,
+        distance: level0(root.join(DISTANCE_TO_SURFACE))?,
+    })
+}
+
 fn read_json(path: &Path) -> Result<Value> {
     let text = fs::read_to_string(path)
         .map_err(|error| Error::invalid(format!("reading {}: {error}", path.display())))?;
@@ -642,6 +711,13 @@ fn check_reference(atlas: &PreparedAtlas, moving: &RegisteredImage, root: &Path)
         .reference
         .as_ref()
         .ok_or_else(|| Error::invalid("the prepared atlas has no reference image"))?;
+    let (dtype, shape) = blockflow::ome_zarr::OmeVolumePyramid::open(path, 0, 0)?
+        .attached_level(0)?
+        .metadata()?;
+    let _moving = memory::lease(
+        memory::voxels(shape) * dtype.size_of() as u64,
+        "the registration's moving image, read to check the atlas reference",
+    )?;
     let moving = read_volume(path)?;
     if moving.shape() != reference.shape() {
         return Err(Error::invalid(format!(
@@ -651,8 +727,21 @@ fn check_reference(atlas: &PreparedAtlas, moving: &RegisteredImage, root: &Path)
             reference.shape()
         )));
     }
-    let (a, b) = (moving.widened(), reference.widened());
-    let differing = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+    // Equal as stored is equal, with nothing widened; otherwise the voxels
+    // that differ are counted a plane at a time.
+    if moving == *reference {
+        return Ok(());
+    }
+    let [nz, ny, nx] = moving.shape();
+    let mut differing = 0;
+    for z in 0..nz {
+        let plane = Region::new(&[z, 0, 0], &[1, ny, nx]);
+        let (a, b) = (
+            moving.slice_region(&plane)?.widened(),
+            reference.slice_region(&plane)?.widened(),
+        );
+        differing += a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+    }
     if differing > 0 {
         return Err(Error::invalid(format!(
             "the atlas reference {} differs from the registration's moving image {} at \

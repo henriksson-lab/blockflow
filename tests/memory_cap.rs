@@ -191,3 +191,71 @@ fn the_executor_admits_only_the_blocks_that_fit_and_writes_the_same_voxels() {
         "admission under a tight budget moved a voxel"
     );
 }
+
+/// An op whose blocks are serialised elsewhere (one device): it says so, and
+/// the planner prices one in flight and the executor admits one at a time.
+struct OneAtATime;
+
+impl blockflow::op::BlockOp for OneAtATime {
+    fn name(&self) -> &'static str {
+        "one at a time"
+    }
+
+    fn reach(&self, _axis: usize, _volume_len: usize) -> usize {
+        0
+    }
+
+    fn accepts(&self, _dtype: Dtype) -> bool {
+        true
+    }
+
+    fn apply(
+        &self,
+        input: &Voxels,
+        out: &mut Voxels,
+        _at: &blockflow::op::Anchor,
+    ) -> blockflow::Result<()> {
+        out.assign(input)
+    }
+
+    fn max_in_flight(&self) -> Option<usize> {
+        Some(1)
+    }
+}
+
+#[test]
+fn an_op_that_runs_one_block_at_a_time_is_planned_and_admitted_so() {
+    let grid = BlockGrid::new(VOLUME, [8, 256, 256]).unwrap();
+    let mut plan = PlanBuilder::new(VOLUME, Dtype::F64, grid);
+    plan.pixels(Chain::op(OneAtATime)).unwrap();
+    let assembly = plan.finish().unwrap();
+    let (_, active) = blockflow::strategy::price_under_budget(
+        &assembly.workflow.chain,
+        &assembly.decomposition,
+        &assembly.work(),
+        &CostModel::default(),
+        8,
+        64 << 30,
+    )
+    .unwrap();
+    assert!(active.iter().all(|set| set.in_flight == 1), "{active:?}");
+    let env =
+        ArrayEnvironment::for_decomposition(input(), &assembly.decomposition, [8, 64, 64]).unwrap();
+    let counting = Arc::new(InFlight::default());
+    let listeners: Vec<Arc<dyn EventListener>> = vec![counting.clone()];
+    execute_phases(
+        "one at a time",
+        &assembly.workflow,
+        &assembly.decomposition,
+        &Hints {
+            concurrency: 8,
+            ..Hints::default()
+        },
+        &env,
+        &listeners,
+        &assembly.work(),
+    )
+    .unwrap();
+    assert_eq!(counting.most.load(Ordering::SeqCst), 1);
+    assert!(env.output() == input());
+}

@@ -13,7 +13,7 @@
 //!
 //! Nothing here changes a result; without the variable every call is a no-op.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use blockflow::listener::EventListener;
@@ -65,6 +65,23 @@ fn reset_peak() {
     let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
 
+/// The live heap bytes now and the most held since the previous call, which
+/// starts the next interval: what a binary with a counting allocator (the
+/// graph's memory test) hands [`set_heap_meter`].
+pub type HeapMeter = fn() -> (u64, u64);
+
+static HEAP_METER: OnceLock<HeapMeter> = OnceLock::new();
+
+/// Add the live heap and its peak to every stage line (and start a stage
+/// interval at every boundary).
+pub fn set_heap_meter(meter: HeapMeter) {
+    let _ = HEAP_METER.set(meter);
+}
+
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 20) as f64
+}
+
 struct Mark {
     what: String,
     wall: Instant,
@@ -100,10 +117,14 @@ impl Profile {
             .last
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        let heap = HEAP_METER.get().map(|meter| meter());
         if let Some(mark) = last.take() {
             let (rss, peak) = memory_mb();
+            let heap = heap.map_or(String::new(), |(live, peak)| {
+                format!("  heap {:>8.1} MB  peak {:>8.1} MB", mb(live), mb(peak))
+            });
             eprintln!(
-                "profile {}: {:<28} wall {:>8.2} s  cpu {:>9.2} s  rss {:>8.0} MB  peak {:>8.0} MB",
+                "profile {}: {:<28} wall {:>8.2} s  cpu {:>9.2} s  rss {:>8.0} MB  peak {:>8.0} MB{heap}",
                 self.scope,
                 mark.what,
                 now.duration_since(mark.wall).as_secs_f64(),

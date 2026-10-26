@@ -16,16 +16,22 @@
 //! * [`pipeline`] is what the CLI runs: OME-Zarr in, transform files, a
 //!   registration sidecar and optionally a warped OME-Zarr volume out, and CSV
 //!   point tables carried between the two images.
+//! * [`place`] finds where a fixed image lies in a moving one by a
+//!   coarse-to-fine correlation search, to start a registration from.
 //! * [`atlas_space`] maps an image's points through a registration into the
 //!   prepared atlas it registered to, checks the two belong together, and
 //!   reads regions, hemispheres, distance to the surface and densities there.
+//! * [`memory`] leases the volumes held resident from the process's memory
+//!   budget, and refuses one a stated cap cannot hold.
 //! * [`report`] measures the fit against a known answer or a recorded elastix
 //!   run.
 
 pub mod atlas_space;
 pub mod compute;
+pub mod memory;
 pub mod parameters;
 pub mod pipeline;
+pub mod place;
 pub mod points;
 pub mod register;
 pub mod report;

@@ -622,7 +622,7 @@ pub fn append_point_distance_phases(
         test,
         Lifecycle::DeleteOnExit,
     ))?;
-    let reach_blocks = reach_for(&plan.grid(), pitch, cap);
+    let reach_blocks = reach_for(plan.grid(), pitch, cap);
     plan.fragments(PointDistanceOp::new(
         "point to mask boundary distance",
         stream,
@@ -773,7 +773,7 @@ mod tests {
             (r.at, f(0), [f(1), f(2), f(3)], f(4) as u64)
         })
         .collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.sort_by_key(|a| a.0);
         rows
     }
 
@@ -787,7 +787,10 @@ mod tests {
         };
         // a wavy layer from a height plus scattered blobs
         let mut m = Array3::from_elem((volume[0], volume[1], volume[2]), false);
-        let (a, b) = (next() * 6.28, next() * 6.28);
+        let (a, b) = (
+            next() * std::f64::consts::TAU,
+            next() * std::f64::consts::TAU,
+        );
         for ((z, y, x), v) in m.indexed_iter_mut() {
             let h = volume[0] as f64 * 0.6
                 + 2.0 * ((y as f64 * 0.3 + a).sin() + (x as f64 * 0.2 + b).cos());
