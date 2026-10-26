@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 #![cfg(feature = "zarr")]
 
-use blockflow::env::Environment;
 use blockflow::voxels::Voxels;
 use blockflow::zarr_env::{PhysicalFrame, PyramidSpec, ZarrEnvironment};
 use ndarray::Array3;

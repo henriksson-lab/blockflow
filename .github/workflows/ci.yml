@@ -104,6 +104,10 @@ jobs:
           # part.
           - os: ubuntu-latest
             features: { name: stardist, key: stardist, flags: "--features stardist", test: "no", examples: "-p blockflow-stardist-ome-zarr -p blockflow-stardist-3d-ome-zarr" }
+          # SAM is a distinct Candle/SAM2 dependency graph. Compile it explicitly;
+          # default-feature jobs cannot catch drift in its training/inference APIs.
+          - os: ubuntu-latest
+            features: { name: sam, key: sam, flags: "--features sam", test: "no" }
           # The other two model adapters, git dependencies for the same reason
           # and at the same risk. Together in one row because they share `burn`,
           # which is most of what either costs to build. `vessel-graph`'s
@@ -292,6 +296,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-lint-${{ hashFiles('Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-lint-
+      - name: Check portable dependency paths
+        run: python3 scripts/check_portable_manifests.py
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features gui,distributed,zarr,model-segment -- -D warnings

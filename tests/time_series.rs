@@ -343,7 +343,7 @@ fn a_label_plane_pyramid_downsamples_space_only() {
     )
     .unwrap();
     let level1 = read_plane(stack.plane(1, 2).unwrap(), &scratch.path().join("read"));
-    assert!(level1.iter().any(|&v| v == id));
+    assert!(level1.contains(&id));
     assert!(level1.iter().all(|&v| v == 0 || v == id));
     // Other frames of level 1 are untouched.
     let other = read_plane(stack.plane(1, 0).unwrap(), &scratch.path().join("read0"));

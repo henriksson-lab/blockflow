@@ -1563,7 +1563,7 @@ fn write_object_rows(
     label_name: &str,
     shape_zyx: [u64; 3],
     spacing_xyz: [f64; 3],
-    rows: &mut Vec<LabelObjectRow>,
+    rows: &mut [LabelObjectRow],
 ) -> Result<()> {
     const ROW_CHUNK: usize = 2048;
     const TILE_ZYX: [u64; 3] = [32, 256, 256];
@@ -1898,8 +1898,8 @@ fn write_level(
     let store = std::sync::Arc::new(FilesystemStore::new(staging).map_err(Error::backend)?);
     let chunk = [
         1u64,
-        level.shape[1].min(256).max(1) as u64,
-        level.shape[2].min(256).max(1) as u64,
+        level.shape[1].clamp(1, 256) as u64,
+        level.shape[2].clamp(1, 256) as u64,
     ];
     let array = ArrayBuilder::new(
         level.shape.map(|v| v as u64).to_vec(),

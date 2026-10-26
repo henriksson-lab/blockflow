@@ -248,10 +248,12 @@ image = { version = "0.25", optional = true }
 ndarray16 = { package = "ndarray", version = "0.16", optional = true }
 cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "4e428d0d20da2b6ac7f12b59d8f3263d2e9c362f", optional = true }
 stardist-rs = { git = "https://github.com/henriksson-lab/stardist-rs.git", rev = "20cb2375f53540ad0f2b490d4e8a7f65d96c95ee", optional = true }
-sam2-rs = { path = "../../em/found/sam2-rs", optional = true }
-sam2-candle-core = { package = "candle-core", path = "../candle/candle-core", optional = true }
-sam2-candle-nn = { package = "candle-nn", path = "../candle/candle-nn", optional = true }
-sam1-candle-transformers = { package = "candle-transformers", path = "../candle/candle-transformers", optional = true }
+# SAM and the StarDist patches share one exact Candle source identity. Optional
+# dependencies are still resolved on non-SAM builds: never use sibling paths here.
+sam2-rs = { git = "https://github.com/henriksson-lab/sam2-rs.git", rev = "90b41cc85849580479049d620a73617d240f2990", optional = true }
+sam2-candle-core = { package = "candle-core", git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2", optional = true }
+sam2-candle-nn = { package = "candle-nn", git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2", optional = true }
+sam1-candle-transformers = { package = "candle-transformers", git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2", optional = true }
 yolo3d-model = { package = "yolo3d", path = "crates/yolo3d", optional = true }
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
@@ -509,10 +511,10 @@ debug-assertions = true
 [patch.crates-io]
 burn = { git = "https://github.com/mahogny/burn.git", rev = "e20ada6837eaadf59e2e78efd572788c178c9bd5" }
 burn-store = { git = "https://github.com/mahogny/burn.git", rev = "e20ada6837eaadf59e2e78efd572788c178c9bd5" }
-candle-core = { git = "https://github.com/mahogny/candle.git", branch = "pr/stardist-candle-integration" }
-candle-kernels = { git = "https://github.com/mahogny/candle.git", branch = "pr/stardist-candle-integration" }
-candle-metal-kernels = { git = "https://github.com/mahogny/candle.git", branch = "pr/stardist-candle-integration" }
-candle-nn = { git = "https://github.com/mahogny/candle.git", branch = "pr/stardist-candle-integration" }
+candle-core = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
+candle-kernels = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
+candle-metal-kernels = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
+candle-nn = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
 
 
 # The browser half lives in `webui/` and is a separate crate with its own

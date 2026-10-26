@@ -1,3 +1,5 @@
+#![cfg(feature = "zarr")]
+
 use blockflow::{
     voxels::Voxels,
     zarr_env::{Compression, PhysicalFrame, TileWriter},

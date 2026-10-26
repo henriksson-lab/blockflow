@@ -652,7 +652,7 @@ impl LabelStack {
         let store = std::sync::Arc::new(FilesystemStore::new(&dir).map_err(Error::backend)?);
         let array = ZarrArray::open(store, "/").map_err(Error::backend)?;
         let mut start = vec![t as u64];
-        start.extend(std::iter::repeat(0).take(shape.len() - 1));
+        start.extend(std::iter::repeat_n(0, shape.len() - 1));
         let mut extent = vec![1u64];
         extent.extend(shape[1..].iter().map(|&n| n as u64));
         let subset = ArraySubset::new_with_start_shape(start, extent).map_err(Error::backend)?;

@@ -656,7 +656,7 @@ mod publish_tests {
             let a = array(&level0, data_type::uint64(), FillValue::from(0u64));
             a.store_array_subset(
                 &ArraySubset::new_with_shape(vec![4, 8, 8]),
-                &vec![value; 256],
+                vec![value; 256],
             )
             .unwrap();
             let table = root.0.join("work/table");
