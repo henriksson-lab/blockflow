@@ -250,10 +250,10 @@ cellpose = { git = "https://github.com/henriksson-lab/cellpose-rs.git", rev = "4
 stardist-rs = { git = "https://github.com/henriksson-lab/stardist-rs.git", rev = "20cb2375f53540ad0f2b490d4e8a7f65d96c95ee", optional = true }
 # SAM and the StarDist patches share one exact Candle source identity. Optional
 # dependencies are still resolved on non-SAM builds: never use sibling paths here.
-sam2-rs = { git = "https://github.com/henriksson-lab/sam2-rs.git", rev = "90b41cc85849580479049d620a73617d240f2990", optional = true }
-sam2-candle-core = { package = "candle-core", git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2", optional = true }
-sam2-candle-nn = { package = "candle-nn", git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2", optional = true }
-sam1-candle-transformers = { package = "candle-transformers", git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2", optional = true }
+sam2-rs = { git = "https://github.com/henriksson-lab/sam2-rs.git", rev = "edb4cb76cfd85bdc69915893a9addea7ebe3bd62", optional = true }
+sam2-candle-core = { package = "candle-core", git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1", optional = true }
+sam2-candle-nn = { package = "candle-nn", git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1", optional = true }
+sam1-candle-transformers = { package = "candle-transformers", git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1", optional = true }
 yolo3d-model = { package = "yolo3d", path = "crates/yolo3d", optional = true }
 burn = { version = "0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-store = { version = "0.22.0-pre.2", default-features = false, features = ["std", "safetensors"], optional = true }
@@ -511,10 +511,10 @@ debug-assertions = true
 [patch.crates-io]
 burn = { git = "https://github.com/mahogny/burn.git", rev = "e20ada6837eaadf59e2e78efd572788c178c9bd5" }
 burn-store = { git = "https://github.com/mahogny/burn.git", rev = "e20ada6837eaadf59e2e78efd572788c178c9bd5" }
-candle-core = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
-candle-kernels = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
-candle-metal-kernels = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
-candle-nn = { git = "https://github.com/mahogny/candle.git", rev = "b27e8c7c04d16c19d335325d7abd6331254c58a2" }
+candle-core = { git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1" }
+candle-kernels = { git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1" }
+candle-metal-kernels = { git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1" }
+candle-nn = { git = "https://github.com/mahogny/candle.git", rev = "0998c8c655ae84330149ddbff509916254b887a1" }
 
 
 # The browser half lives in `webui/` and is a separate crate with its own

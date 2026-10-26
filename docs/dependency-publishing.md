@@ -6,12 +6,12 @@ The 2026-10-26 fix follows this dependency order:
 
 | Repository | Original working checkout | Revision / branch to push |
 | --- | --- | --- |
-| `henriksson-lab/gemm` | `/data/henriksson/github/claude/candle/vendor/gemm` | `a9ea398a74911f4a0cc79261044cbdf4ce9efd91`, branch `candle-gemm-tuning` |
-| `mahogny/candle` | `/data/henriksson/github/claude/candle` | `b27e8c7c04d16c19d335325d7abd6331254c58a2`, branch `sam2-cpu-perf` |
-| `henriksson-lab/sam2-rs` | `/data/henriksson/github/em/found/sam2-rs` | `90b41cc85849580479049d620a73617d240f2990`, branch `main` |
+| `mahogny/gemm` | `/data/henriksson/github/claude/gemm` | `a9ea398a74911f4a0cc79261044cbdf4ce9efd91`, branch `main` |
+| `mahogny/candle` | `/data/henriksson/github/claude/candle` | `0998c8c655ae84330149ddbff509916254b887a1`, branch `sam2-cpu-perf` |
+| `henriksson-lab/sam2-rs` | `/data/henriksson/github/em/found/sam2-rs` | `edb4cb76cfd85bdc69915893a9addea7ebe3bd62`, branch `main` |
 | `henriksson-lab/blockflow` | `/data/henriksson/github/claude/blockflow` | this fix, branch `main` |
 
-First create the lab GEMM fork from <https://github.com/sarah-quinones/gemm>. The old `sarah-ek/gemm` URL redirects there. The original GEMM checkout keeps `origin` for that upstream and `fork` for `git@github.com:henriksson-lab/gemm.git`; publish the patch branch to `fork`. No force-push or upstream branch replacement is necessary: Cargo can fetch a pinned commit from that patch branch.
+The GEMM fork is <https://github.com/mahogny/gemm>, created from <https://github.com/sarah-quinones/gemm>. The old `sarah-ek/gemm` upstream URL redirects there. The patch was transferred unchanged into the standalone GEMM checkout: its `origin` points to `git@github.com:mahogny/gemm.git`. Push its `main` branch normally; the pinned patch commit is unchanged. The old nested checkout is no longer the working location for publishing this fork.
 
 Push GEMM, then Candle, then SAM2 before pushing Blockflow. Otherwise even a non-SAM CI job cannot resolve its dependency graph. Native CPU tests and dependency resolution are validated locally with temporary per-process Git URL rewrites to the original checkouts. These rewrites are not committed or installed globally. They verify exact git contents without claiming the revisions are already available on GitHub. Remote CI must be rerun after publication.
 
