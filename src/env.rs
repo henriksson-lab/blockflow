@@ -302,11 +302,18 @@ impl EnvCounters {
     /// thing that panics a run. An unbalanced pair is a bug in the caller, and
     /// `peak_resident_bytes` going wrong is a wrong *number*, not wrong data.
     pub fn drop_resident(&self, bytes: u64) {
-        let _ = self
-            .resident_bytes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(current.saturating_sub(bytes))
-            });
+        let mut current = self.resident_bytes.load(Ordering::SeqCst);
+        loop {
+            match self.resident_bytes.compare_exchange_weak(
+                current,
+                current.saturating_sub(bytes),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// `(writes, reads, bytes written, bytes read)` for the sidecar store.
@@ -2189,6 +2196,26 @@ mod tests {
     use super::*;
     use crate::probes::{AffineOp, IdentityOp};
     use ndarray::Array3;
+
+    #[test]
+    fn resident_counter_drops_atomically_and_saturates() {
+        let counters = std::sync::Arc::new(EnvCounters::default());
+        counters.add_resident(8000);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let counters = &counters;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        counters.drop_resident(1);
+                    }
+                });
+            }
+        });
+        assert_eq!(counters.resident_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.peak_resident_bytes.load(Ordering::SeqCst), 8000);
+        counters.drop_resident(u64::MAX);
+        assert_eq!(counters.resident_bytes.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn the_array_environment_round_trips_a_region() {

@@ -761,7 +761,7 @@ pub struct PartitionOp {
 
 /// The input and output streams of [`PartitionOp`] beside its rows and shapes.
 pub struct PartitionStreams {
-    /// Other blocks' objects near this block's, from [`NearbyShapesOp`].
+    /// Other blocks' objects near this block's, from [`crate::ops::interior::NearbyShapesOp`].
     pub nearby: (String, usize),
     pub summary: (String, Lifecycle),
     pub territories: (String, Lifecycle),

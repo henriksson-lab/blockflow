@@ -65,7 +65,7 @@
 //! **Pixel phases only, and that is a limit of the *price*, not of the
 //! simulator.** [`Strategy::decompose`] partitions chain slots, so every phase
 //! it produces is
-//! [`PhaseWork::Pixels`](crate::fragment::PhaseWork::Pixels) — and the
+//! [`crate::fragment::PhaseWork::Pixels`] — and the
 //! planner's objective is defined over exactly that: a run of chain slots, one
 //! traversal per image read, writing the image after it. A fragment phase owns
 //! no slots and reads no image that way, so pricing one with the pixel rule

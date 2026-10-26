@@ -88,11 +88,11 @@ fn hemisphere(z: usize) -> u32 {
 }
 
 /// Distance to the rim in voxels, as the reference ships its field.
-fn distance(z: usize, y: usize, x: usize) -> f32 {
-    let last = ATLAS - 1;
+fn distance(z: usize, y: usize, x: usize, shape: [usize; 3]) -> f32 {
     [z, y, x]
         .iter()
-        .map(|c| (*c).min(last - *c) as f32)
+        .zip(shape)
+        .map(|(c, extent)| (*c).min(extent - 1 - *c) as f32)
         .fold(f32::INFINITY, f32::min)
 }
 
@@ -107,7 +107,7 @@ fn write_atlas(root: &Path, shape: [usize; 3]) {
             hemisphere(z)
         }))),
         distance_to_surface: Some(Voxels::F32(Array3::from_shape_fn(s, |(z, y, x)| {
-            distance(z, y, x)
+            distance(z, y, x, shape)
         }))),
     };
     let window = PreparedWindow {
@@ -319,7 +319,7 @@ fn cells_land_where_the_registration_puts_them_and_are_labelled_there() {
             let [vz, vy, vx] = voxel.map(|v| v as usize);
             assert_eq!(regions[row], i64::from(region(vz, vy, vx)), "row {row}");
             assert_eq!(hemispheres[row], i64::from(hemisphere(vz)), "row {row}");
-            let depth = f64::from(distance(vz, vy, vx));
+            let depth = f64::from(distance(vz, vy, vx, [ATLAS; 3]));
             assert_eq!(distances[row], depth, "row {row}");
             // The reference's crust: strictly deeper than 2 voxels.
             assert_eq!(passes[row] == 1, band && depth > 2.0, "row {row}");

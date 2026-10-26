@@ -41,7 +41,7 @@ impl SourceLayout {
 pub struct SampleChunk {
     pub values: Voxels,
     /// None means all values valid. A returned mask is one byte per voxel in
-    /// the accounting (Vec<bool> uses no more than that).
+    /// the accounting (`Vec<bool>` uses no more than that).
     pub valid: Option<Vec<bool>>,
 }
 /// One immutable selected image/level, already calibrated. `read_chunk` must

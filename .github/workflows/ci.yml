@@ -201,7 +201,7 @@ jobs:
       # time, and this row has already paid for that compile.
       - name: Build the examples that need these features
         if: matrix.features.examples
-        run: cargo build --lib --bins ${{ matrix.features.examples }}
+        run: cargo build ${{ matrix.features.examples }}
       # `--no-fail-fast` so one broken suite does not hide the state of the other
       # hundred. No `--ignored`: see the header.
       - name: Test
@@ -246,8 +246,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-members-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-members-
-      - run: cargo build --workspace --all-targets $EXCLUDE
-      - run: cargo test --workspace --no-fail-fast $EXCLUDE
+      # Member CLIs intentionally refuse debug builds; integration tests invoke them.
+      - run: cargo build --release --workspace --all-targets $EXCLUDE
+      - run: cargo test --release --workspace --no-fail-fast $EXCLUDE
 
   # **The lint gate.** `-D warnings` over every target, which is why the crate's
   # exceptions live in `Cargo.toml`'s `[lints.clippy]` rather than in `lib.rs`:

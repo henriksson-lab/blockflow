@@ -13,3 +13,6 @@ __pycache__/
 
 # Local diagnostic/build scratch.
 /.tmp/
+
+# Separate local SAM2 checkout; builds keep using the pinned git dependency.
+/sam2-rs/

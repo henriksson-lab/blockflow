@@ -301,7 +301,7 @@ impl PlaneSampleOp {
         Ok(())
     }
 }
-/// Append a physical plane on an output grid [1,rows,columns].
+/// Append a physical plane on an output grid `[1, rows, columns]`.
 pub fn append_plane_sample_phase(
     builder: &mut PlanBuilder,
     op: PlaneSampleOp,

@@ -12,14 +12,14 @@
 //!
 //! | piece | what it owns |
 //! |---|---|
-//! | [`DetectionSet`] | the acquired timeline of one series and its detections, validated |
-//! | [`candidates`] | gated candidate edges between consecutive acquired frames, optional overlap features |
-//! | [`Linker`] | the extension point: candidates in, [`TrackGraph`] out |
-//! | [`lap::FrameLapLinker`] | the version-1 linker: frame-to-frame LAP (Jaqaman et al. 2008, step one) |
-//! | [`segment::SegmentLapLinker`] | frame LAP, then gap closing, splitting and merging (step two) |
-//! | [`graph`] | the graph, its validation, tracks as maximal unbranched chains, observational events |
-//! | [`export`] | detection/track/link rows, CTC `res_track.txt`, napari-style CSV |
-//! | [`drift`] | stage drift between frames by phase correlation |
+//! | [`crate::track::DetectionSet`] | the acquired timeline of one series and its detections, validated |
+//! | [`crate::track::candidates`] | gated candidate edges between consecutive acquired frames, optional overlap features |
+//! | [`crate::track::Linker`] | the extension point: candidates in, [`crate::track::TrackGraph`] out |
+//! | [`crate::track::lap::FrameLapLinker`] | the version-1 linker: frame-to-frame LAP (Jaqaman et al. 2008, step one) |
+//! | [`crate::track::segment::SegmentLapLinker`] | frame LAP, then gap closing, splitting and merging (step two) |
+//! | [`crate::track::graph`] | the graph, its validation, tracks as maximal unbranched chains, observational events |
+//! | [`crate::track::export`] | detection/track/link rows, CTC `res_track.txt`, napari-style CSV |
+//! | [`crate::track::drift`] | stage drift between frames by phase correlation |
 //!
 //! # Coordinates
 //!
@@ -36,7 +36,7 @@
 //! A series is an ordered list of acquired frame indices. A frame with no
 //! detections is still a frame; an index that was never acquired is a *gap*.
 //! Version 1 never links across a gap: tracks end before it and start after it
-//! with [`graph::StartReason::FrameGap`] / [`graph::EndReason::FrameGap`], so a
+//! with [`crate::track::graph::StartReason::FrameGap`] / [`crate::track::graph::EndReason::FrameGap`], so a
 //! later gap-closing linker can find and rejoin exactly those.
 
 use std::collections::BTreeMap;

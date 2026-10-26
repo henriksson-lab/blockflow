@@ -39,7 +39,7 @@
 //!
 //! # What the predictor is, in this crate's terms
 //!
-//! A [`Combine`](crate::op::Combine), not a [`BlockOp`](crate::op::BlockOp): it
+//! A [`crate::op::Combine`], not a [`crate::op::BlockOp`]: it
 //! reads 91 images and writes one, which is precisely a fan-in. See
 //! [`crate::ops::classify`]. Two properties follow and both matter to the
 //! planner:

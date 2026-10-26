@@ -7,7 +7,7 @@
 //! # What this is for
 //!
 //! `statistics::Statistics` records what *this* machine did, partitioned by
-//! [`MachineKey`](crate::statistics::MachineKey) so that "a coefficient measured
+//! [`crate::statistics::MachineKey`] so that "a coefficient measured
 //! elsewhere is not evidence here". That is the right rule for planning a run.
 //! It is the wrong rule for **testing a planner**, where the question is the
 //! opposite one: does the search still choose well when the disk is ten times
@@ -24,7 +24,7 @@
 //!
 //! # One source of coefficients, two judges
 //!
-//! A scenario owns a [`Snapshot`](crate::statistics::Snapshot) and **both judges are derived from it**:
+//! A scenario owns a [`crate::statistics::Snapshot`] and **both judges are derived from it**:
 //!
 //! * the planner, through [`Scenario::model`](crate::scenario::Scenario::model) — `Snapshot::calibrate`, the same
 //!   path a real run's evidence takes;
