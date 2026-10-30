@@ -7,6 +7,10 @@ reuse of Blockflow's cache and prefetcher, is described in
 The implemented Cellpose-to-YOLO transfer workflow, release command, and first
 DAPI experiment are documented in [`DAPI_TRAINING.md`](DAPI_TRAINING.md).
 
+The `yolo-dapi-train` binary also builds without GPU features for `--help` and
+`--inspect-only`. Training, evaluation and sweeps require `--features libtorch`
+or `--features cuda`; portable builds report this requirement at runtime.
+
 This is the normal Blockflow entry point for the YOLO fragment operation. It
 reads an OME-Zarr level through `ZarrEnvironment`, assembles the fragment phase
 with `PlanBuilder`, runs one model invocation per configured image block, owns

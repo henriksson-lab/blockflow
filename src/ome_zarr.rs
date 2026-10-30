@@ -64,7 +64,14 @@ impl OmeVolumePyramid {
         let axes = multiscale
             .get("axes")
             .and_then(Value::as_array)
-            .ok_or_else(|| Error::invalid("OME multiscales entry has no axes"))?
+            .or_else(|| {
+                multiscale
+                    .pointer("/coordinateSystems/0/axes")
+                    .and_then(Value::as_array)
+            })
+            .ok_or_else(|| {
+                Error::invalid("OME multiscales entry has no axes or coordinate system")
+            })?
             .iter()
             .map(|axis| {
                 axis.as_str()
@@ -344,6 +351,19 @@ pub fn publish_label(
     publication: LabelPublication<'_>,
     workers: usize,
 ) -> Result<()> {
+    publish_label_to(pyramid, pyramid.image_root(), publication, workers)
+}
+
+/// Install a label image and optional object table below `image_root`, while
+/// deriving spatial metadata and pyramid shapes from the read-only source.
+/// This lets workflows publish a compact derived overlay without cloning the
+/// source image.
+pub fn publish_label_to(
+    pyramid: &OmeVolumePyramid,
+    image_root: &Path,
+    publication: LabelPublication<'_>,
+    workers: usize,
+) -> Result<()> {
     let name = publication.name;
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         return Err(Error::invalid(format!(
@@ -358,8 +378,8 @@ pub fn publish_label(
             publication.level0.display()
         )));
     }
-    let labels_dir = pyramid.image_root().join("labels");
-    let tables_dir = pyramid.image_root().join("tables");
+    let labels_dir = image_root.join("labels");
+    let tables_dir = image_root.join("tables");
     let refuse_existing = || -> Result<()> {
         for existing in [labels_dir.join(name), tables_dir.join(name)] {
             if !publication.replace && existing.exists() {
@@ -526,12 +546,15 @@ fn fixed_indices(
 }
 
 fn project_transforms(transforms: Option<&Value>, spatial: [usize; 3]) -> Value {
-    Value::Array(
-        transforms
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|transform| {
+    fn collect(rows: &[Value], spatial: [usize; 3], out: &mut Vec<Value>) {
+        for transform in rows {
+            if transform.get("type").and_then(Value::as_str) == Some("sequence") {
+                if let Some(nested) = transform.get("transformations").and_then(Value::as_array) {
+                    collect(nested, spatial, out);
+                }
+                continue;
+            }
+            let projected = (|| {
                 let kind = transform.get("type")?.as_str()?;
                 let key = match kind {
                     "scale" => "scale",
@@ -548,9 +571,17 @@ fn project_transforms(transforms: Option<&Value>, spatial: [usize; 3]) -> Value 
                 object.insert("type".into(), Value::String(kind.into()));
                 object.insert(key.into(), Value::Array(projected));
                 Some(Value::Object(object))
-            })
-            .collect(),
-    )
+            })();
+            if let Some(projected) = projected {
+                out.push(projected);
+            }
+        }
+    }
+    let mut projected = Vec::new();
+    if let Some(rows) = transforms.and_then(Value::as_array) {
+        collect(rows, spatial, &mut projected);
+    }
+    Value::Array(projected)
 }
 
 fn read_json(path: &Path) -> Result<Value> {

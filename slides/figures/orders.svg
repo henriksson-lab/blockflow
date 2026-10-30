@@ -1,0 +1,97 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1304 312' width='1304' height='312' font-family='Helvetica, Arial, sans-serif'>
+<defs><marker id='arrow' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#333333'/></marker></defs>
+<text x='10' y='32' font-size='15' text-anchor='start' fill='#333333' font-weight='bold'>Phase-major (materialise)</text>
+<text x='127.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 0</text>
+<text x='219.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 1</text>
+<text x='311.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 2</text>
+<text x='403.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 3</text>
+<text x='495.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 4</text>
+<text x='587.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 5</text>
+<text x='78' y='95.0' font-size='12' text-anchor='end' fill='#333333' font-weight='normal'>phase 0</text>
+<text x='78' y='169.0' font-size='12' text-anchor='end' fill='#333333' font-weight='normal'>phase 1</text>
+<text x='78' y='243.0' font-size='12' text-anchor='end' fill='#333333' font-weight='normal'>phase 2</text>
+<rect x='90' y='70' width='74' height='40' rx='5' fill='#DDE8F5' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='127.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>1</text>
+<rect x='182' y='70' width='74' height='40' rx='5' fill='#D3DFEE' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='219.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>2</text>
+<rect x='274' y='70' width='74' height='40' rx='5' fill='#C8D6E7' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='311.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>3</text>
+<rect x='366' y='70' width='74' height='40' rx='5' fill='#BECDE0' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='403.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>4</text>
+<rect x='458' y='70' width='74' height='40' rx='5' fill='#B3C4D9' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='495.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>5</text>
+<rect x='550' y='70' width='74' height='40' rx='5' fill='#A9BBD1' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='587.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>6</text>
+<rect x='90' y='144' width='74' height='40' rx='5' fill='#9FB2CA' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='127.0' y='169.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>7</text>
+<rect x='182' y='144' width='74' height='40' rx='5' fill='#94A9C3' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='219.0' y='169.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>8</text>
+<rect x='274' y='144' width='74' height='40' rx='5' fill='#8AA0BC' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='311.0' y='169.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>9</text>
+<rect x='366' y='144' width='74' height='40' rx='5' fill='#7F97B5' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='403.0' y='169.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>10</text>
+<rect x='458' y='144' width='74' height='40' rx='5' fill='#758EAE' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='495.0' y='169.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>11</text>
+<rect x='550' y='144' width='74' height='40' rx='5' fill='#6A85A7' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='587.0' y='169.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>12</text>
+<rect x='90' y='218' width='74' height='40' rx='5' fill='#607CA0' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='127.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>13</text>
+<rect x='182' y='218' width='74' height='40' rx='5' fill='#567398' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='219.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>14</text>
+<rect x='274' y='218' width='74' height='40' rx='5' fill='#4B6A91' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='311.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>15</text>
+<rect x='366' y='218' width='74' height='40' rx='5' fill='#41618A' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='403.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>16</text>
+<rect x='458' y='218' width='74' height='40' rx='5' fill='#365883' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='495.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>17</text>
+<rect x='550' y='218' width='74' height='40' rx='5' fill='#2C4F7C' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='587.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>18</text>
+<text x='10' y='296' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>whole intermediate image is written, then re-read</text>
+<text x='672' y='32' font-size='15' text-anchor='start' fill='#333333' font-weight='bold'>Block-major (fuse)</text>
+<text x='789.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 0</text>
+<text x='881.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 1</text>
+<text x='973.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 2</text>
+<text x='1065.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 3</text>
+<text x='1157.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 4</text>
+<text x='1249.0' y='58' font-size='12' text-anchor='middle' fill='#333333' font-weight='normal'>block 5</text>
+<text x='740' y='95.0' font-size='12' text-anchor='end' fill='#333333' font-weight='normal'>phase 0</text>
+<text x='740' y='169.0' font-size='12' text-anchor='end' fill='#333333' font-weight='normal'>phase 1</text>
+<text x='740' y='243.0' font-size='12' text-anchor='end' fill='#333333' font-weight='normal'>phase 2</text>
+<rect x='752' y='70' width='74' height='40' rx='5' fill='#DDE8F5' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='789.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>1</text>
+<rect x='844' y='70' width='74' height='40' rx='5' fill='#D3DFEE' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='881.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>2</text>
+<rect x='752' y='144' width='74' height='40' rx='5' fill='#C8D6E7' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='789.0' y='169.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>3</text>
+<rect x='936' y='70' width='74' height='40' rx='5' fill='#BECDE0' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='973.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>4</text>
+<rect x='844' y='144' width='74' height='40' rx='5' fill='#B3C4D9' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='881.0' y='169.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>5</text>
+<rect x='752' y='218' width='74' height='40' rx='5' fill='#A9BBD1' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='789.0' y='243.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>6</text>
+<rect x='1028' y='70' width='74' height='40' rx='5' fill='#9FB2CA' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1065.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>7</text>
+<rect x='936' y='144' width='74' height='40' rx='5' fill='#94A9C3' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='973.0' y='169.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>8</text>
+<rect x='844' y='218' width='74' height='40' rx='5' fill='#8AA0BC' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='881.0' y='243.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>9</text>
+<rect x='1120' y='70' width='74' height='40' rx='5' fill='#7F97B5' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1157.0' y='95.0' font-size='14' text-anchor='middle' fill='#333333' font-weight='bold'>10</text>
+<rect x='1028' y='144' width='74' height='40' rx='5' fill='#758EAE' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1065.0' y='169.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>11</text>
+<rect x='936' y='218' width='74' height='40' rx='5' fill='#6A85A7' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='973.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>12</text>
+<rect x='1212' y='70' width='74' height='40' rx='5' fill='#607CA0' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1249.0' y='95.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>13</text>
+<rect x='1120' y='144' width='74' height='40' rx='5' fill='#567398' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1157.0' y='169.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>14</text>
+<rect x='1028' y='218' width='74' height='40' rx='5' fill='#4B6A91' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1065.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>15</text>
+<rect x='1212' y='144' width='74' height='40' rx='5' fill='#41618A' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1249.0' y='169.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>16</text>
+<rect x='1120' y='218' width='74' height='40' rx='5' fill='#365883' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1157.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>17</text>
+<rect x='1212' y='218' width='74' height='40' rx='5' fill='#2C4F7C' fill-opacity='1' stroke='#777' stroke-width='1'/>
+<text x='1249.0' y='243.0' font-size='14' text-anchor='middle' fill='white' font-weight='bold'>18</text>
+<text x='672' y='296' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>a wavefront: few intermediates alive at once</text>
+</svg>

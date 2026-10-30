@@ -22,10 +22,11 @@
 //!    vertical and Euclidean distance to the epithelium top, a brightness
 //!    split ([`beads`], [`measure`]).
 //!
-//! Output: label images and object tables published into the image for a
-//! viewer such as newvolim (`bjorn-layers`, `bjorn-surfaces`, `bjorn-beads`,
-//! `bjorn-large-af488`; colours in [`style`]), CSVs and QC images. A run
-//! replaces all previous output.
+//! Output: label images and object tables published either into the image or
+//! into a separate derived overlay for a viewer such as ROZT
+//! (`bjorn-layers`, `bjorn-surfaces`, `bjorn-beads`, `bjorn-large-af488`;
+//! colours in [`style`]), plus CSVs and QC images. A run replaces previous
+//! output at its chosen destination.
 
 pub mod beads;
 pub mod cells;

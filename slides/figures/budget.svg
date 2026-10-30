@@ -1,0 +1,21 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 760 229' width='760' height='229' font-family='Helvetica, Arial, sans-serif'>
+<defs><marker id='arrow' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#333333'/></marker></defs>
+<text x='30' y='35' font-size='16' text-anchor='start' fill='#333333' font-weight='bold'>One memory budget, in bytes</text>
+<rect x='30' y='60' width='294.0' height='54' rx='0' fill='#4C78A8' fill-opacity='0.85' stroke='#333333' stroke-width='1'/>
+<text x='177.0' y='92.0' font-size='13' text-anchor='middle' fill='white' font-weight='normal'>compute: blocks in flight</text>
+<text x='177.0' y='134' font-size='12' text-anchor='middle' fill='#666' font-weight='normal'>Reserved</text>
+<rect x='324.0' y='60' width='182.0' height='54' rx='0' fill='#72B7B2' fill-opacity='0.85' stroke='#333333' stroke-width='1'/>
+<text x='415.0' y='92.0' font-size='13' text-anchor='middle' fill='#333333' font-weight='normal'>chunk cache</text>
+<text x='415.0' y='134' font-size='12' text-anchor='middle' fill='#666' font-weight='normal'>Opportunistic</text>
+<rect x='506.0' y='60' width='98.00000000000001' height='54' rx='0' fill='#ECA82C' fill-opacity='0.85' stroke='#333333' stroke-width='1'/>
+<text x='555.0' y='92.0' font-size='13' text-anchor='middle' fill='#333333' font-weight='normal'>prefetch</text>
+<text x='555.0' y='134' font-size='12' text-anchor='middle' fill='#666' font-weight='normal'>Opportunistic</text>
+<rect x='604.0' y='60' width='126.0' height='54' rx='0' fill='white' fill-opacity='0.85' stroke='#333333' stroke-width='1'/>
+<text x='667.0' y='92.0' font-size='13' text-anchor='middle' fill='#333333' font-weight='normal'>free</text>
+<text x='30' y='174' font-size='14' text-anchor='start' fill='#4C78A8' font-weight='bold'>Reserved (compute)</text>
+<text x='30' y='194' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>may wait for room — a blocked worker is slow,</text>
+<text x='30' y='212' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>an unadmitted one is a crash</text>
+<text x='410' y='174' font-size='14' text-anchor='start' fill='#3E8A85' font-weight='bold'>Opportunistic (cache, prefetch)</text>
+<text x='410' y='194' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>never waits; is told to release</text>
+<text x='410' y='212' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>when compute needs the bytes</text>
+</svg>

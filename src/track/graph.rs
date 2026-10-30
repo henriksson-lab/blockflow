@@ -226,6 +226,12 @@ pub struct TrackGraph {
 }
 
 impl TrackGraph {
+    /// Detection identities and frame indices in canonical ID order, including
+    /// isolated detections. Used to validate fixed-mask comparisons.
+    pub fn detection_frames(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.nodes.iter().map(|(&id, &t)| (id, t))
+    }
+
     /// Validate `links` against `detections` and `capabilities`: both ends
     /// exist, time strictly increases, each kind agrees with its `dt` and with
     /// the node degrees, and degrees do not exceed what the linker declared.

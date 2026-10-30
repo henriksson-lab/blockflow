@@ -7,12 +7,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use blockflow::fragment::fold_fragments;
 use blockflow::object_table::finalize_object_table;
 use blockflow::ome_zarr::OmeVolumePyramid;
-use blockflow::ome_zarr::{publish_label, LabelPublication};
+use blockflow::ome_zarr::{publish_label_to, LabelPublication};
 use blockflow::op::SourceInput;
 use blockflow::ops::fill::append_open_on;
 use blockflow::ops::label::{LabelComponentsOp, RelabelComponentsOp};
@@ -32,7 +33,10 @@ use blockflow::ops::{
 };
 use blockflow::sidecar::Lifecycle;
 use blockflow::strategy::{execute_phases, Hints};
-use blockflow::{BlockGrid, Chain, Error, ImageId, PlanBuilder, Result, ZarrEnvironment};
+use blockflow::{
+    BlockGrid, Chain, Error, ImageId, PlanBuilder, ProgressMeta, Result, StreamingLog,
+    ZarrEnvironment,
+};
 use clap::Parser;
 use ndarray::Array3;
 
@@ -61,9 +65,13 @@ const OBJECT_ABOVE_MUCUS_SLICES: f32 = 2.0;
 #[derive(Debug, Clone, Parser)]
 #[command(about = "Segment mucus top + epithelium surfaces, detect beads, measure distances")]
 pub struct Config {
-    /// OME-Zarr image (a local copy: labels and tables are written into it).
+    /// Read-only source OME-Zarr image.
     #[arg(long)]
     pub zarr: PathBuf,
+    /// Root receiving derived labels and tables. When omitted, outputs are
+    /// installed into the source image for backwards-compatible CLI use.
+    #[arg(long)]
+    pub output_zarr: Option<PathBuf>,
     /// Directory for CSV and QC output.
     #[arg(long)]
     pub out: PathBuf,
@@ -237,6 +245,10 @@ pub fn run(config: &Config) -> Result<Summary> {
     let t0 = Instant::now();
     fs::create_dir_all(&args.out).map_err(Error::backend)?;
     let epi = OmeVolumePyramid::open(&args.zarr, CH_EPI, 0)?;
+    let output_root = args
+        .output_zarr
+        .as_deref()
+        .unwrap_or_else(|| epi.image_root());
     let voxel = epi.voxel_size();
     let work = args.out.join(".work");
 
@@ -244,7 +256,7 @@ pub fn run(config: &Config) -> Result<Summary> {
         heights,
         beads: rows,
         large: object_rows,
-    } = run_plan(args, &epi, &work)?;
+    } = run_plan(args, &epi, output_root, &work)?;
     eprintln!("plan and publish done {:.1}s", t0.elapsed().as_secs_f64());
     eprintln!(
         "large AF488 objects (dying-cell candidates): {}",
@@ -292,7 +304,7 @@ pub fn run(config: &Config) -> Result<Summary> {
         .iter()
         .map(|&y| {
             zio::read_label_window(
-                &root.join("labels").join(OBJECTS),
+                &output_root.join("labels").join(OBJECTS),
                 [0, y as i64, 0],
                 [nz, 1, nx],
             )
@@ -409,7 +421,12 @@ fn cue_chain(sigma: [f64; 3], leaf: Option<Chain>, last: ops::ZTapsOp) -> Result
 
 /// The whole analysis as one plan: image 0 = AF488, supplied 0 = AF594,
 /// supplied 1 = C-Blue.
-fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Results> {
+fn run_plan(
+    args: &Config,
+    epi: &OmeVolumePyramid,
+    output_root: &Path,
+    work: &Path,
+) -> Result<Results> {
     let src_epi = epi.attached_level(0)?;
     let src_muc = OmeVolumePyramid::open(&args.zarr, CH_MUCUS, 0)?.attached_level(0)?;
     let src_blue = OmeVolumePyramid::open(&args.zarr, CH_BEADS, 0)?.attached_level(0)?;
@@ -837,15 +854,34 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
             .collect::<Result<_>>()?,
         ..Hints::default()
     };
-    execute_phases(
+    let progress = StreamingLog::from_jobman_env(ProgressMeta::from_plan(
+        std::env::var("ROZT_JOB_ID").unwrap_or_else(|_| "bjorn".into()),
+        "bjorn",
+        &assembly.workflow,
+        &assembly.decomposition,
+    ))
+    .map_err(Error::backend)?
+    .map(Arc::new);
+    let listeners = progress
+        .iter()
+        .map(|listener| listener.clone() as Arc<dyn blockflow::listener::EventListener>)
+        .collect::<Vec<_>>();
+    let execution = execute_phases(
         "bjorn",
         &assembly.workflow,
         &assembly.decomposition,
         &hints,
         &env,
-        &[],
+        &listeners,
         &assembly.work(),
-    )?;
+    );
+    if let Some(progress) = progress {
+        progress.finish(
+            if execution.is_ok() { "ok" } else { "failed" },
+            execution.as_ref().err().map(ToString::to_string),
+        );
+    }
+    execution?;
 
     // read back rows and the solved surfaces
     let mut surfaces = None;
@@ -937,8 +973,9 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
             EPITHELIUM => style::epithelium_style().as_object().cloned(),
             _ => None,
         };
-        publish_label(
+        publish_label_to(
             epi,
+            output_root,
             LabelPublication {
                 name,
                 level0: &work.join(format!("level{}", phase.image()?.index())),
@@ -951,7 +988,7 @@ fn run_plan(args: &Config, epi: &OmeVolumePyramid, work: &Path) -> Result<Result
         )?;
     }
     // a rerun replaces the previous output: no stale stained epithelium
-    let labels = epi.image_root().join("labels");
+    let labels = output_root.join("labels");
     if p_epithelium.is_none() && labels.join(EPITHELIUM).exists() {
         fs::remove_dir_all(labels.join(EPITHELIUM)).map_err(Error::backend)?;
         blockflow::label_pyramid::refresh_label_registry(&labels)?;

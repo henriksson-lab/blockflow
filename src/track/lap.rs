@@ -49,6 +49,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
+use super::cost::{GeometricCost, ScoredCandidates, ScoredLinker};
 use super::graph::{LinkKind, TrackGraph, TrackLink};
 use super::{CandidateSet, DetectionSet, Linker, LinkerCapabilities};
 use crate::error::{Error, Result};
@@ -135,27 +136,6 @@ impl FrameLapLinker {
         params.validate()?;
         Ok(Self { params })
     }
-
-    fn cost(&self, edge: &super::Candidate) -> Result<f64> {
-        let mut cost = edge.distance * edge.distance;
-        if self.params.iou_weight > 0.0 {
-            let overlap = edge.overlap.ok_or_else(|| {
-                Error::invalid(format!(
-                    "iou_weight is set but candidate {} -> {} has no overlap features",
-                    edge.from, edge.to
-                ))
-            })?;
-            cost += self.params.iou_weight * (1.0 - overlap.iou);
-        }
-        cost += self.params.size_weight * edge.relative_size_change;
-        if !cost.is_finite() || cost < 0.0 {
-            return Err(Error::invalid(format!(
-                "candidate {} -> {} has invalid cost {cost}",
-                edge.from, edge.to
-            )));
-        }
-        Ok(cost)
-    }
 }
 
 impl Linker for FrameLapLinker {
@@ -199,6 +179,20 @@ impl FrameLapLinker {
         detections: &DetectionSet,
         candidates: &CandidateSet,
     ) -> Result<Vec<TrackLink>> {
+        let scorer = GeometricCost::new(self.params.iou_weight, self.params.size_weight)?;
+        let scores = ScoredCandidates::score(detections, candidates, &scorer)?;
+        self.frame_links_scored(detections, &scores)
+    }
+
+    /// Solve with precomputed frame-association costs. The legacy IoU/size
+    /// weights are bypassed; the configured birth/death alternatives still apply.
+    pub fn frame_links_scored(
+        &self,
+        detections: &DetectionSet,
+        scores: &ScoredCandidates,
+    ) -> Result<Vec<TrackLink>> {
+        scores.validate(detections)?;
+        let candidates = scores.candidates();
         // Group candidates by the frame they leave.
         let mut by_pair: BTreeMap<u64, Vec<(usize, f64)>> = BTreeMap::new();
         for (index, edge) in candidates.edges().iter().enumerate() {
@@ -223,7 +217,7 @@ impl FrameLapLinker {
             by_pair
                 .entry(edge.from_t)
                 .or_default()
-                .push((index, self.cost(edge)?));
+                .push((index, scores.costs()[index]));
         }
 
         let mut links = Vec::new();
@@ -255,6 +249,20 @@ impl FrameLapLinker {
             }
         }
         Ok(links)
+    }
+}
+
+impl ScoredLinker for FrameLapLinker {
+    fn link_scored(
+        &self,
+        detections: &DetectionSet,
+        scores: &ScoredCandidates,
+    ) -> Result<TrackGraph> {
+        TrackGraph::new(
+            detections,
+            self.frame_links_scored(detections, scores)?,
+            self.capabilities(),
+        )
     }
 }
 
@@ -330,7 +338,12 @@ fn solve_pair(
 /// or cubic in time.
 ///
 /// Deterministic: ties in the queue break by node index.
-pub(crate) fn assign_sparse(rows: &[Vec<(usize, f64)>], columns: usize) -> Result<Vec<usize>> {
+///
+/// Public so that evaluation code (matching detections to ground truth, as
+/// in `examples/celegans-4d`) solves with the linker's own assignment.
+/// Errors when a row has no edge or no complete assignment exists; give each
+/// row a private alternative column to make every instance feasible.
+pub fn assign_sparse(rows: &[Vec<(usize, f64)>], columns: usize) -> Result<Vec<usize>> {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 

@@ -1,0 +1,43 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 760 390' width='760' height='390' font-family='Helvetica, Arial, sans-serif'>
+<defs><marker id='arrow' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#333333'/></marker></defs>
+<text x='175.0' y='28' font-size='15' text-anchor='middle' fill='#54A24B' font-weight='bold'>halo ≥ reach: blocks tile</text>
+<rect x='40' y='50' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='130' y='50' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='220' y='50' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='40' y='140' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='130' y='140' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='220' y='140' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='40' y='230' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='130' y='230' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='220' y='230' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='104' y='114' width='142' height='142' rx='0' fill='#F58518' fill-opacity='0.18' stroke='#F58518' stroke-width='2'/>
+<rect x='104' y='114' width='142' height='142' rx='0' fill='none' fill-opacity='1' stroke='#F58518' stroke-width='2' stroke-dasharray='6,4'/>
+<rect x='130' y='140' width='90' height='90' rx='0' fill='#54A24B' fill-opacity='0.75' stroke='#333333' stroke-width='1.5'/>
+<rect x='122' y='132' width='106' height='106' rx='0' fill='none' fill-opacity='1' stroke='#4C78A8' stroke-width='2' stroke-dasharray='2,3'/>
+<text x='175.0' y='342' font-size='13' text-anchor='middle' fill='#333333' font-weight='normal'>halo 26 ≥ reach 18</text>
+<text x='535.0' y='28' font-size='15' text-anchor='middle' fill='#E45756' font-weight='bold'>halo &lt; reach: gap, tiling check fires</text>
+<rect x='400' y='50' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='490' y='50' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='580' y='50' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='400' y='140' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='490' y='140' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='580' y='140' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='400' y='230' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='490' y='230' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='580' y='230' width='90' height='90' rx='0' fill='white' fill-opacity='1' stroke='#999' stroke-width='1'/>
+<rect x='478' y='128' width='114' height='114' rx='0' fill='#F58518' fill-opacity='0.18' stroke='#F58518' stroke-width='2'/>
+<rect x='478' y='128' width='114' height='114' rx='0' fill='none' fill-opacity='1' stroke='#F58518' stroke-width='2' stroke-dasharray='6,4'/>
+<rect x='490' y='140' width='90' height='90' rx='0' fill='#E45756' fill-opacity='0.75' stroke='#333333' stroke-width='1.5'/>
+<rect x='504' y='154' width='62' height='62' rx='0' fill='#54A24B' fill-opacity='0.95' stroke='none' stroke-width='1'/>
+<rect x='490' y='140' width='90' height='90' rx='0' fill='none' fill-opacity='1' stroke='#333333' stroke-width='1.5'/>
+<rect x='504' y='154' width='62' height='62' rx='0' fill='none' fill-opacity='1' stroke='#4C78A8' stroke-width='2' stroke-dasharray='2,3'/>
+<text x='535.0' y='342' font-size='13' text-anchor='middle' fill='#333333' font-weight='normal'>halo 12 &lt; reach 26</text>
+<rect x='20' y='358' width='18' height='14' rx='0' fill='#F58518' fill-opacity='0.18' stroke='#F58518' stroke-width='2' stroke-dasharray='6,4'/>
+<text x='44' y='370' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>read extent = core + halo</text>
+<rect x='205' y='358' width='18' height='14' rx='0' fill='none' fill-opacity='1' stroke='#4C78A8' stroke-width='2' stroke-dasharray='2,3'/>
+<text x='229' y='370' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>trustworthy = read − reach</text>
+<rect x='390' y='358' width='18' height='14' rx='0' fill='#54A24B' fill-opacity='0.75' stroke='#54A24B' stroke-width='2'/>
+<text x='414' y='370' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>valid = core ∩ trustworthy</text>
+<rect x='575' y='358' width='18' height='14' rx='0' fill='#E45756' fill-opacity='0.75' stroke='#E45756' stroke-width='2'/>
+<text x='599' y='370' font-size='13' text-anchor='start' fill='#333333' font-weight='normal'>gap (no block owns it)</text>
+</svg>

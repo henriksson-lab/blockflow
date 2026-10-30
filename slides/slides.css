@@ -1,0 +1,6 @@
+.reveal ul { font-size: 0.75em; }
+.reveal h2 { font-size: 1.4em; }
+.reveal .mermaid svg { max-height: 360px; }
+/* Same font when mermaid measures and when it draws, or labels clip. */
+.reveal .cell-output-display svg[id^="mermaid"],
+.reveal .cell-output-display svg[id^="mermaid"] * { font-family: Arial, Helvetica, sans-serif !important; }

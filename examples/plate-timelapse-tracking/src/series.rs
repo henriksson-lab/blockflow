@@ -33,7 +33,7 @@ use crate::pool::parallel;
 use crate::segment::{default_drift_level, estimate_drift, movie_sample, percentiles};
 use crate::tables::{identity_graph, write_detections, write_links, write_tracks, TableContext};
 
-fn durable_lineages(tracks: &[blockflow::track::Track]) -> BTreeMap<u64, u64> {
+pub fn durable_lineages(tracks: &[blockflow::track::Track]) -> BTreeMap<u64, u64> {
     let by_id = tracks
         .iter()
         .map(|track| (track.track_id, track))

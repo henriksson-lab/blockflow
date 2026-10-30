@@ -412,3 +412,93 @@ fn a_single_frame_image_gets_a_stack_with_a_time_axis_of_one() {
         [1, Y, X]
     );
 }
+
+#[test]
+fn ngff_06_irregular_times_are_consumed_and_preserved_by_labels() {
+    let scratch = ScratchDir::new("time-series", "ngff06");
+    let root = scratch.path().join("image");
+    movie(&root);
+    let mut group: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("zarr.json")).unwrap()).unwrap();
+    let multiscale = &mut group["attributes"]["ome"]["multiscales"][0];
+    let axes = multiscale["axes"].take();
+    multiscale.as_object_mut().unwrap().remove("axes");
+    multiscale["coordinateSystems"] = json!([
+        {"name":"physical", "axes":axes.clone()},
+        {"name":"native", "axes":axes}
+    ]);
+    multiscale["datasets"][0]["coordinateTransformations"] = json!([{
+        "type":"sequence", "input":{"path":"0"}, "output":{"name":"native"},
+        "transformations":[
+            {"type":"scale", "scale":[1.0,1.0,0.5,0.5]},
+            {"type":"translation", "translation":[0.0,0.0,0.25,0.25]}
+        ]
+    }]);
+    multiscale["coordinateTransformations"] = json!([{
+        "type":"byDimension", "input":{"name":"native"}, "output":{"name":"physical"},
+        "transformations":[
+            {"transformation":{"type":"coordinates", "path":"coordinateTransformations/time"}, "inputAxes":[0], "outputAxes":[0]},
+            {"transformation":{"type":"identity"}, "inputAxes":[1,2,3], "outputAxes":[1,2,3]}
+        ]
+    }]);
+    group["attributes"]["ome"]["version"] = json!("0.6");
+    fs::write(root.join("zarr.json"), serde_json::to_vec(&group).unwrap()).unwrap();
+    let coordinates = root.join("coordinateTransformations/time");
+    fs::create_dir_all(coordinates.join("0")).unwrap();
+    let metadata = StorageLayout::chunked(vec![T, 1], Compression::None)
+        .array_metadata(
+            &[T, 1],
+            Dtype::F64,
+            json!(0.0),
+            Some(json!(["t", "coordinate"])),
+        )
+        .unwrap();
+    fs::write(
+        coordinates.join("0/zarr.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    fs::write(coordinates.join("zarr.json"), serde_json::to_vec(&json!({
+        "zarr_format":3,"node_type":"group","attributes":{"ome":{"version":"0.6","multiscales":[{
+            "coordinateSystems":[{"name":"time_coordinates","axes":[
+                {"name":"t","type":"time","unit":"second"},
+                {"name":"coordinate","type":"coordinate","discrete":true}
+            ]}],
+            "datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1.0],"input":{"path":"0"},"output":{"name":"time_coordinates"}}]}]
+        }]}}
+    })).unwrap()).unwrap();
+    let store = Arc::new(FilesystemStore::new(&coordinates).unwrap());
+    ZarrArray::open(store, "/0")
+        .unwrap()
+        .store_chunk(&[0, 0], &[0.0f64, 7.0, 31.0])
+        .unwrap();
+
+    let source = TimeSeriesImage::open(&root).unwrap();
+    let times = source.timeline().unwrap();
+    assert_eq!(
+        times
+            .iter()
+            .map(|frame| frame.elapsed_seconds)
+            .collect::<Vec<_>>(),
+        [Some(0.0), Some(7.0), Some(31.0)]
+    );
+    assert_eq!(source.spacing(0).unwrap(), [1.0, 0.5, 0.5]);
+    let labels =
+        LabelStack::create(scratch.path().join("labels"), &source, [8, 8], "../../").unwrap();
+    let labels_metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(labels.root().join("zarr.json")).unwrap()).unwrap();
+    assert_eq!(labels_metadata["attributes"]["ome"]["version"], "0.6");
+    assert_eq!(
+        labels_metadata["attributes"]["ome"]["multiscales"][0]["coordinateTransformations"][0]
+            ["type"],
+        "byDimension"
+    );
+    let store = Arc::new(
+        FilesystemStore::new(labels.root().join("coordinateTransformations/time")).unwrap(),
+    );
+    let saved: Vec<f64> = ZarrArray::open(store, "/0")
+        .unwrap()
+        .retrieve_array_subset(&ArraySubset::new_with_shape(vec![T as u64, 1]))
+        .unwrap();
+    assert_eq!(saved, [0.0, 7.0, 31.0]);
+}

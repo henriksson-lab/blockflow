@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::json;
 
+use super::cost::{ScoredCandidates, ScoredLinker};
 use super::graph::{LinkKind, TrackGraph, TrackLink};
 use super::lap::{assign_sparse, FrameLapLinker, LapParams};
 use super::{CandidateSet, Detection, DetectionSet, Linker, LinkerCapabilities};
@@ -189,7 +190,31 @@ impl Linker for SegmentLapLinker {
     }
 
     fn link(&self, detections: &DetectionSet, candidates: &CandidateSet) -> Result<TrackGraph> {
-        let mut links = self.frame.frame_links(detections, candidates)?;
+        self.finish_links(detections, self.frame.frame_links(detections, candidates)?)
+    }
+}
+
+impl ScoredLinker for SegmentLapLinker {
+    /// Only the frame-association step uses imported scores. The legacy
+    /// segment stage retains its distance-squared costs for gaps/splits/merges.
+    fn link_scored(
+        &self,
+        detections: &DetectionSet,
+        scores: &ScoredCandidates,
+    ) -> Result<TrackGraph> {
+        self.finish_links(
+            detections,
+            self.frame.frame_links_scored(detections, scores)?,
+        )
+    }
+}
+
+impl SegmentLapLinker {
+    fn finish_links(
+        &self,
+        detections: &DetectionSet,
+        mut links: Vec<TrackLink>,
+    ) -> Result<TrackGraph> {
         let capabilities = self.capabilities();
         let segments = TrackGraph::new(detections, links.clone(), LinkerCapabilities::default())?
             .tracks(detections, 0.0)?;

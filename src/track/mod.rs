@@ -14,6 +14,11 @@
 //! |---|---|
 //! | [`crate::track::DetectionSet`] | the acquired timeline of one series and its detections, validated |
 //! | [`crate::track::candidates`] | gated candidate edges between consecutive acquired frames, optional overlap features |
+//! | [`crate::track::cost`] | pluggable candidate scoring and precomputed-score solver API |
+//! | [`crate::track::greedy`] | simple greedy association baseline |
+//! | [`crate::track::evaluation`] | complete-reference fixed-mask link and division metrics |
+//! | [`crate::track::refine`] | scored endpoint continuation/gap refinement of existing graphs |
+//! | [`crate::track::matching`] | spatial correspondence between different same-frame segmentations |
 //! | [`crate::track::Linker`] | the extension point: candidates in, [`crate::track::TrackGraph`] out |
 //! | [`crate::track::lap::FrameLapLinker`] | the version-1 linker: frame-to-frame LAP (Jaqaman et al. 2008, step one) |
 //! | [`crate::track::segment::SegmentLapLinker`] | frame LAP, then gap closing, splitting and merging (step two) |
@@ -44,19 +49,26 @@ use std::collections::BTreeMap;
 use crate::error::{Error, Result};
 
 pub mod candidates;
+pub mod cost;
 pub mod drift;
+pub mod evaluation;
 pub mod export;
 pub mod graph;
+pub mod greedy;
 pub mod lap;
+pub mod matching;
+pub mod refine;
 pub mod segment;
 
 pub use candidates::{
     generate_candidates, overlap_counts, Candidate, CandidateParams, CandidateSet, OverlapCounts,
 };
+pub use cost::{CostedLinker, GeometricCost, LinkCost, ScoredCandidates, ScoredLinker};
 pub use graph::{
     BorderState, EndReason, LinkKind, StartReason, Track, TrackEvents, TrackGraph, TrackLink,
 };
-pub use lap::{AlternativeCost, FrameLapLinker, LapParams};
+pub use greedy::GreedyFrameLinker;
+pub use lap::{assign_sparse, AlternativeCost, FrameLapLinker, LapParams};
 pub use segment::{GapClosing, SegmentAlternative, SegmentLapLinker, SegmentParams};
 
 /// One acquired frame of a series.
@@ -341,3 +353,6 @@ pub trait Linker: Send + Sync {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cost_tests;

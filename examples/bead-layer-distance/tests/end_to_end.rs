@@ -317,3 +317,40 @@ fn finds_layers_beads_and_the_large_object_on_any_grid() {
     assert_eq!(strip(&plain), strip(&csv));
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cli_emits_job_progress() {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("bjorn-progress-test-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let zarr = dir.join("synthetic.ome.zarr");
+    write_image(&zarr);
+    let progress = dir.join("progress.jsonl");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_bead-layer-distance"))
+        .arg("--zarr")
+        .arg(&zarr)
+        .arg("--out")
+        .arg(dir.join("report"))
+        .args(["--workers", "2", "--bead-min-response", "50"])
+        .env("ROZT_JOB_ID", "bead-progress-test")
+        .env("JOBMAN_PROGRESS_FILE", &progress)
+        .env("JOBMAN_PROGRESS_LEVEL", "blocks")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let records: Vec<serde_json::Value> = fs::read_to_string(&progress)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(records.iter().any(|r| r["type"] == "run_started"));
+    assert!(records
+        .iter()
+        .any(|r| r["type"] == "run_finished" && r["outcome"] == "ok"));
+    assert!(records
+        .iter()
+        .any(|r| r.to_string().contains("task_admitted")));
+    fs::remove_dir_all(dir).unwrap();
+}

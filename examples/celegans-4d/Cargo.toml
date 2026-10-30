@@ -1,0 +1,44 @@
+[package]
+name = "blockflow-celegans-4d"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "C. elegans 4-D DIC recordings (Endrov / S-BIAD191) on Blockflow: hand-annotated lineages as tracking tables, benchmarks."
+
+[dependencies]
+blockflow = { path = "../..", features = ["zarr"] }
+clap = { version = "4.5", features = ["derive"] }
+ndarray = "0.17"
+ngff-label-map = { path = "../../crates/ngff-label-map", default-features = false }
+blockflow-plate-timelapse-tracking = { path = "../plate-timelapse-tracking" }
+roxmltree = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+# dic_maps writes its map groups chunk by chunk; the version blockflow itself uses
+zarrs = "0.23.13"
+
+[lib]
+name = "celegans_4d"
+path = "src/lib.rs"
+
+[[bin]]
+name = "import_endrov_lineage"
+path = "src/bin/import_endrov_lineage.rs"
+
+[[bin]]
+name = "holdout_benchmark"
+path = "src/bin/holdout_benchmark.rs"
+
+[[bin]]
+name = "score_tracking"
+path = "src/bin/score_tracking.rs"
+
+[[bin]]
+name = "dic_calibrate"
+path = "src/bin/dic_calibrate.rs"
+
+[[bin]]
+name = "dic_maps"
+path = "src/bin/dic_maps.rs"

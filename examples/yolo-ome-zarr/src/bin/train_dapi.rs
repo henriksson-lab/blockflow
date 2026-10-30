@@ -1260,6 +1260,36 @@ fn persist_split(output: &Path, resume: Option<&Path>, split: &serde_json::Value
     Ok(())
 }
 
+// Keep data inspection available in portable builds. Only training/evaluation
+// needs a GPU backend; selecting it is a runtime requirement, not a build error.
+fn training_device() -> Result<Device> {
+    #[cfg(feature = "libtorch")]
+    {
+        Ok(Device::libtorch_cuda(burn::tensor::DeviceIndex::Default).autodiff())
+    }
+    #[cfg(all(feature = "cuda", not(feature = "libtorch")))]
+    {
+        Ok(Device::cuda(burn::tensor::DeviceIndex::Default).autodiff())
+    }
+    #[cfg(not(any(feature = "cuda", feature = "libtorch")))]
+    {
+        anyhow::bail!(
+            "yolo-dapi-train training/evaluation requires --features libtorch or cuda; \
+             --inspect-only is available without either feature"
+        )
+    }
+}
+
+#[cfg(all(test, not(any(feature = "cuda", feature = "libtorch"))))]
+mod backend_tests {
+    #[test]
+    fn portable_build_reports_missing_training_backend() {
+        let error = super::training_device().expect_err("no GPU backend was compiled");
+        assert!(error.to_string().contains("--features libtorch or cuda"));
+        assert!(error.to_string().contains("--inspect-only"));
+    }
+}
+
 fn main() -> Result<()> {
     let program_started = Instant::now();
     let args = Args::parse();
@@ -1433,12 +1463,7 @@ fn main() -> Result<()> {
         output_dir: args.output.clone(),
     };
 
-    #[cfg(feature = "libtorch")]
-    let device = Device::libtorch_cuda(burn::tensor::DeviceIndex::Default).autodiff();
-    #[cfg(all(feature = "cuda", not(feature = "libtorch")))]
-    let device = Device::cuda(burn::tensor::DeviceIndex::Default).autodiff();
-    #[cfg(not(any(feature = "cuda", feature = "libtorch")))]
-    compile_error!("yolo-dapi-train requires --features libtorch or cuda");
+    let device = training_device()?;
 
     let started = Instant::now();
     if args.sweep.is_some() {

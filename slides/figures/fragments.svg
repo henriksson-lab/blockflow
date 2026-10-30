@@ -1,0 +1,75 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 305' width='800' height='305' font-family='Helvetica, Arial, sans-serif'>
+<defs><marker id='arrow' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#333333'/></marker></defs>
+<defs>
+<clipPath id='c000'><rect x='20.0' y='60.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c001'><rect x='20.0' y='160.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c010'><rect x='120.0' y='60.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c011'><rect x='120.0' y='160.0' width='100.0' height='100.0'/></clipPath>
+</defs>
+<rect x='20' y='60' width='200' height='200' rx='0' fill='white' fill-opacity='1' stroke='#333333' stroke-width='1'/>
+<circle cx='60' cy='105' r='22' fill='#4C78A8' fill-opacity='0.8' stroke='#333333' clip-path='url(#c000)'/>
+<circle cx='120' cy='155' r='26' fill='#F58518' fill-opacity='0.8' stroke='#333333' clip-path='url(#c000)'/>
+<circle cx='120' cy='155' r='26' fill='#54A24B' fill-opacity='0.8' stroke='#333333' clip-path='url(#c001)'/>
+<circle cx='120' cy='155' r='26' fill='#E45756' fill-opacity='0.8' stroke='#333333' clip-path='url(#c010)'/>
+<circle cx='120' cy='155' r='26' fill='#B279A2' fill-opacity='0.8' stroke='#333333' clip-path='url(#c011)'/>
+<circle cx='180' cy='100' r='18' fill='#72B7B2' fill-opacity='0.8' stroke='#333333' clip-path='url(#c010)'/>
+<circle cx='75' cy='210' r='20' fill='#9D755D' fill-opacity='0.8' stroke='#333333' clip-path='url(#c001)'/>
+<circle cx='170' cy='220' r='24' fill='#ECA82C' fill-opacity='0.8' stroke='#333333' clip-path='url(#c011)'/>
+<circle cx='195' cy='165' r='14' fill='#FF9DA6' fill-opacity='0.8' stroke='#333333' clip-path='url(#c010)'/>
+<circle cx='195' cy='165' r='14' fill='#79706E' fill-opacity='0.8' stroke='#333333' clip-path='url(#c011)'/>
+<circle cx='50' cy='155' r='12' fill='#BAB0AC' fill-opacity='0.8' stroke='#333333' clip-path='url(#c000)'/>
+<circle cx='50' cy='155' r='12' fill='#D67195' fill-opacity='0.8' stroke='#333333' clip-path='url(#c001)'/>
+<circle cx='130' cy='90' r='12' fill='#4C78A8' fill-opacity='0.8' stroke='#333333' clip-path='url(#c000)'/>
+<circle cx='130' cy='90' r='12' fill='#F58518' fill-opacity='0.8' stroke='#333333' clip-path='url(#c010)'/>
+<line x1='120.0' y1='60' x2='120.0' y2='260' stroke='#333333' stroke-width='1.5' stroke-dasharray='6,4'/>
+<line x1='20' y1='160.0' x2='220' y2='160.0' stroke='#333333' stroke-width='1.5' stroke-dasharray='6,4'/>
+<text x='120' y='30' font-size='15' text-anchor='middle' fill='#333333' font-weight='bold'>1. segment each block</text>
+<text x='120' y='48' font-size='12' text-anchor='middle' fill='#666' font-weight='normal'>volume → fragments</text>
+<line x1='232' y1='160' x2='288' y2='160' stroke='#333333' stroke-width='2' marker-end='url(#arrow)'/>
+<defs>
+<clipPath id='c100'><rect x='300.0' y='60.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c101'><rect x='300.0' y='160.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c110'><rect x='400.0' y='60.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c111'><rect x='400.0' y='160.0' width='100.0' height='100.0'/></clipPath>
+</defs>
+<rect x='300' y='60' width='200' height='200' rx='0' fill='white' fill-opacity='1' stroke='#333333' stroke-width='1'/>
+<circle cx='340' cy='105' r='22' fill='#BAB0AC' fill-opacity='0.5' stroke='#333333' clip-path='url(#c100)'/>
+<circle cx='400' cy='155' r='26' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c100)'/>
+<circle cx='400' cy='155' r='26' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c101)'/>
+<circle cx='400' cy='155' r='26' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c110)'/>
+<circle cx='400' cy='155' r='26' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c111)'/>
+<circle cx='460' cy='100' r='18' fill='#BAB0AC' fill-opacity='0.5' stroke='#333333' clip-path='url(#c110)'/>
+<circle cx='355' cy='210' r='20' fill='#BAB0AC' fill-opacity='0.5' stroke='#333333' clip-path='url(#c101)'/>
+<circle cx='450' cy='220' r='24' fill='#BAB0AC' fill-opacity='0.5' stroke='#333333' clip-path='url(#c111)'/>
+<circle cx='475' cy='165' r='14' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c110)'/>
+<circle cx='475' cy='165' r='14' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c111)'/>
+<circle cx='330' cy='155' r='12' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c100)'/>
+<circle cx='330' cy='155' r='12' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c101)'/>
+<circle cx='410' cy='90' r='12' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c100)'/>
+<circle cx='410' cy='90' r='12' fill='#F58518' fill-opacity='0.85' stroke='#333333' clip-path='url(#c110)'/>
+<line x1='400.0' y1='60' x2='400.0' y2='260' stroke='#333333' stroke-width='1.5' stroke-dasharray='6,4'/>
+<line x1='300' y1='160.0' x2='500' y2='160.0' stroke='#333333' stroke-width='1.5' stroke-dasharray='6,4'/>
+<text x='400' y='30' font-size='15' text-anchor='middle' fill='#333333' font-weight='bold'>2. fragments at the seams</text>
+<text x='400' y='48' font-size='12' text-anchor='middle' fill='#666' font-weight='normal'>fragments → fragments</text>
+<line x1='512' y1='160' x2='568' y2='160' stroke='#333333' stroke-width='2' marker-end='url(#arrow)'/>
+<defs>
+<clipPath id='c200'><rect x='580.0' y='60.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c201'><rect x='580.0' y='160.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c210'><rect x='680.0' y='60.0' width='100.0' height='100.0'/></clipPath>
+<clipPath id='c211'><rect x='680.0' y='160.0' width='100.0' height='100.0'/></clipPath>
+</defs>
+<rect x='580' y='60' width='200' height='200' rx='0' fill='white' fill-opacity='1' stroke='#333333' stroke-width='1'/>
+<circle cx='620' cy='105' r='22' fill='#4C78A8' fill-opacity='0.8' stroke='#333333'/>
+<circle cx='680' cy='155' r='26' fill='#F58518' fill-opacity='0.8' stroke='#333333'/>
+<circle cx='740' cy='100' r='18' fill='#54A24B' fill-opacity='0.8' stroke='#333333'/>
+<circle cx='635' cy='210' r='20' fill='#B279A2' fill-opacity='0.8' stroke='#333333'/>
+<circle cx='730' cy='220' r='24' fill='#E45756' fill-opacity='0.8' stroke='#333333'/>
+<circle cx='755' cy='165' r='14' fill='#72B7B2' fill-opacity='0.8' stroke='#333333'/>
+<circle cx='610' cy='155' r='12' fill='#9D755D' fill-opacity='0.8' stroke='#333333'/>
+<circle cx='690' cy='90' r='12' fill='#ECA82C' fill-opacity='0.8' stroke='#333333'/>
+<line x1='680.0' y1='60' x2='680.0' y2='260' stroke='#333333' stroke-width='1.5' stroke-dasharray='2,6'/>
+<line x1='580' y1='160.0' x2='780' y2='160.0' stroke='#333333' stroke-width='1.5' stroke-dasharray='2,6'/>
+<text x='680' y='30' font-size='15' text-anchor='middle' fill='#333333' font-weight='bold'>3. merge → one id per object</text>
+<text x='680' y='48' font-size='12' text-anchor='middle' fill='#666' font-weight='normal'>fragments → volume + table</text>
+<text x='400' y='292' font-size='13' text-anchor='middle' fill='#333333' font-weight='normal'>same blocks, same task DAG — only the payload is no longer pixels</text>
+</svg>

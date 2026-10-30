@@ -31,7 +31,8 @@ pub struct Candidate {
     pub from: u64,
     pub to: u64,
     pub from_t: u64,
-    /// Frame-index difference. Always 1 in version 1.
+    /// Frame-index difference. The ordinary generator uses 1; imported
+    /// endpoint-refinement candidates may span longer intervals.
     pub dt: u64,
     /// Elapsed time between the two frames, when the timeline has timestamps.
     pub elapsed_seconds: Option<f64>,

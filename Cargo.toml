@@ -29,6 +29,8 @@ members = [
     "examples/yolo-3d-ome-zarr",
     "examples/classical-3d-centers-ome-zarr",
     "examples/plate-timelapse-tracking",
+    "examples/tracking-suite",
+    "examples/celegans-4d",
     "examples/bead-layer-distance",
     "examples/shell-objects-3d-ome-zarr",
     "examples/tile-stitching",

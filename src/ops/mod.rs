@@ -24,6 +24,7 @@
 // which is this list's job rather than a reader's.
 // | module | ops | what it makes expressible |
 // |---|---|---|
+// | vessel_trace | trace, trace_with_required_points, fit_paths_with_required_points | bounded resident image-guided graph curves with required interior points and latent branch assignment |
 // | `voxelwise` | a general map, and the connectives over two inputs | the **sink of a diamond**: reach 0, two operands, which nothing here could express |
 // | `rank` | an order statistic of a neighbourhood, the median included | a reach derived from a filter size, and a constant algebra that is exact rather than approximate |
 // | `morphology` | erode, dilate, open, close | a reach that is **twice** the element, because two of the four are compositions |
@@ -69,6 +70,8 @@
 // | `plane_sample` | physical planar intensity or support sampling | strict voxel-center domain, f64 accumulation and bounded affine source footprints |
 // | `surfaces` | stacked height-field surfaces found as one exact minimum cut, and the region labels between them | a **global combinatorial optimum** under the planner without the volume in memory: the cut needs each surface's cost pooled into columns, so blocks pool their own columns, a barrier `reduce` solves the small graph with `crate::graph_cut`, and blocks paint the answer. Bit-identical across block grids whose edges are multiples of the stride |
 // | `segment_split` | one segment of a fragment grouping split in two (or k) along its weakest membrane, from user seeds | the first op that **edits a grouping rather than computing one**: an exact minimum s-t cut (`crate::graph_cut`) over one segment's subgraph of a `rag::Rag`, with `-ln p`, area-weighted capacities and seeds as hard constraints. It is the proofreading counterpart of `agglomerate`, called per edit on a resident graph |
+// | `dic` | DIC normalisation, phase reconstruction (Tikhonov-regularised inverse of the shear derivative, Fourier domain), a smoothness map (isotropic texture energy) with a centre-surround nucleus-likeness, and a shell-free shear estimate from gradient moments | the first ops parameterised by a **calibrated direction**: one bright-edge angle, measured per movie (`eggshell`, or `GradientMoments`), orients the integration — and the first in-plane barrier that is a Fourier transform of each whole plane (`DicIntegrateOp`: reach `All` in `y, x`, none in `z`) |
+// | `eggshell` | the eggshell of an embryo: per-plane ellipse (texture rays, outermost thin line, ridge), an ellipsoid across planes, its mask, and the edge-contrast samples a DIC calibration fits `a + b·cos(φ − θ)` to | **resident calibration geometry**, not an op: a few planes per movie reduced to seven numbers that later ops take as parameters (the two-run form of `docs/GUIDE.md` §4.3); the conic fit is Halir & Flusser's direct least squares under a deterministic RANSAC |
 //
 // Four modules here have no row, and this is the list saying which and why —
 // under the rule above, an absence has to be a statement rather than a gap in
@@ -323,9 +326,11 @@ pub mod cost;
 pub mod deconvolve;
 pub mod destripe;
 pub mod detect;
+pub mod dic;
 pub mod diffuse;
 pub mod directional;
 pub mod edges;
+pub mod eggshell;
 pub mod element;
 pub mod envelope;
 pub mod exposure;
@@ -1101,3 +1106,6 @@ pub use tabulate::{
 };
 
 pub mod activity;
+
+/// Bounded resident image-guided endpoint/group tracing; graph output, no volume sweep.
+pub mod vessel_trace;

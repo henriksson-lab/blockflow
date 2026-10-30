@@ -54,6 +54,8 @@ pub struct TimeSeriesImage {
     y: usize,
     x: usize,
     levels: Vec<TimeLevel>,
+    timeline: Vec<Frame>,
+    ngff_06: bool,
 }
 
 impl TimeSeriesImage {
@@ -69,10 +71,10 @@ impl TimeSeriesImage {
             .ok_or_else(|| {
                 Error::invalid(format!("{} has no OME multiscales entry", root.display()))
             })?;
-        let axes = multiscale
-            .get("axes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::invalid("OME multiscales entry has no axes"))?
+        let axes = multiscale_axes(multiscale)
+            .ok_or_else(|| {
+                Error::invalid("OME multiscales entry has no axes or coordinate system")
+            })?
             .clone();
         let names = axes
             .iter()
@@ -158,7 +160,11 @@ impl TimeSeriesImage {
                 }
             }
         }
-        Ok(Self {
+        let ngff_06 = metadata
+            .pointer("/attributes/ome/version")
+            .and_then(Value::as_str)
+            == Some("0.6");
+        let mut image = Self {
             root,
             axes,
             names,
@@ -168,7 +174,11 @@ impl TimeSeriesImage {
             y,
             x,
             levels,
-        })
+            timeline: Vec::new(),
+            ngff_06,
+        };
+        image.timeline = image.read_timeline(multiscale)?;
+        Ok(image)
     }
 
     pub fn root(&self) -> &Path {
@@ -218,20 +228,7 @@ impl TimeSeriesImage {
     /// The acquired timeline: one [`Frame`] per stored time index. Elapsed
     /// seconds come from the `t` scale and unit when the unit is a time unit.
     pub fn timeline(&self) -> Result<Vec<Frame>> {
-        let seconds_per_index = match self.t {
-            None => None,
-            Some(t) => {
-                let unit = self.axes[t].get("unit").and_then(Value::as_str);
-                unit.and_then(seconds_per_unit)
-                    .map(|factor| factor * self.scale(0).map(|s| s[t]).unwrap_or(1.0))
-            }
-        };
-        Ok((0..self.n_frames() as u64)
-            .map(|t_index| Frame {
-                t_index,
-                elapsed_seconds: seconds_per_index.map(|s| s * t_index as f64),
-            })
-            .collect())
+        Ok(self.timeline.clone())
     }
 
     /// One frame of one channel at `level`, as a rank-three image.
@@ -289,16 +286,7 @@ impl TimeSeriesImage {
 
     fn scale(&self, level: usize) -> Result<Vec<f64>> {
         let rank = self.names.len();
-        let scale = self
-            .level(level)?
-            .coordinate_transformations
-            .as_array()
-            .and_then(|rows| {
-                rows.iter()
-                    .find(|row| row.get("type").and_then(Value::as_str) == Some("scale"))
-            })
-            .and_then(|row| row.get("scale"))
-            .and_then(Value::as_array)
+        let scale = find_transform_values(&self.level(level)?.coordinate_transformations, "scale")
             .map(|values| {
                 values
                     .iter()
@@ -314,6 +302,146 @@ impl TimeSeriesImage {
         }
         Ok(scale)
     }
+
+    fn translation(&self, level: usize) -> Result<Vec<f64>> {
+        let rank = self.names.len();
+        let values = find_transform_values(
+            &self.level(level)?.coordinate_transformations,
+            "translation",
+        )
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_f64().unwrap_or(0.0))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![0.0; rank]);
+        if values.len() != rank {
+            return Err(Error::invalid(format!(
+                "translation transform has {} entries for {rank} axes",
+                values.len()
+            )));
+        }
+        Ok(values)
+    }
+
+    fn read_timeline(&self, multiscale: &Value) -> Result<Vec<Frame>> {
+        let Some(t) = self.t else {
+            return Ok(vec![Frame {
+                t_index: 0,
+                elapsed_seconds: None,
+            }]);
+        };
+        let factor = self.axes[t]
+            .get("unit")
+            .and_then(Value::as_str)
+            .and_then(seconds_per_unit);
+        if let Some(path) = time_coordinate_path(multiscale, t) {
+            let path = Path::new(path);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(Error::invalid(format!(
+                    "time coordinate path {path:?} is not image-relative"
+                )));
+            }
+            let group = self.root.join(path);
+            let metadata = read_json(&group.join("zarr.json"))?;
+            let dataset = metadata
+                .pointer("/attributes/ome/multiscales/0/datasets/0/path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::invalid("time coordinate group has no dataset"))?;
+            let store = std::sync::Arc::new(FilesystemStore::new(&group).map_err(Error::backend)?);
+            let array = ZarrArray::open(store, &format!("/{dataset}")).map_err(Error::backend)?;
+            let expected = self.n_frames();
+            if array.shape() != [expected as u64, 1] {
+                return Err(Error::invalid(format!(
+                    "time coordinate array has shape {:?}, expected [{expected}, 1]",
+                    array.shape()
+                )));
+            }
+            let values: Vec<f64> = array
+                .retrieve_array_subset(&ArraySubset::new_with_shape(vec![expected as u64, 1]))
+                .map_err(Error::backend)?;
+            if values.iter().any(|value| !value.is_finite())
+                || values.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(Error::invalid(
+                    "time coordinates must be finite and strictly increasing",
+                ));
+            }
+            return Ok(values
+                .into_iter()
+                .enumerate()
+                .map(|(t_index, value)| Frame {
+                    t_index: t_index as u64,
+                    elapsed_seconds: factor.map(|factor| value * factor),
+                })
+                .collect());
+        }
+        let scale = self.scale(0)?[t];
+        let translation = self.translation(0)?[t];
+        Ok((0..self.n_frames())
+            .map(|t_index| Frame {
+                t_index: t_index as u64,
+                elapsed_seconds: factor
+                    .map(|factor| (translation + scale * t_index as f64) * factor),
+            })
+            .collect())
+    }
+}
+
+fn multiscale_axes(multiscale: &Value) -> Option<&Vec<Value>> {
+    multiscale
+        .get("axes")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            multiscale
+                .pointer("/coordinateSystems/0/axes")
+                .and_then(Value::as_array)
+        })
+}
+
+fn find_transform_values<'a>(transforms: &'a Value, kind: &str) -> Option<&'a Vec<Value>> {
+    transforms.as_array()?.iter().find_map(|transform| {
+        if transform.get("type").and_then(Value::as_str) == Some(kind) {
+            transform.get(kind)?.as_array()
+        } else if transform.get("type").and_then(Value::as_str) == Some("sequence") {
+            find_transform_values(transform.get("transformations")?, kind)
+        } else {
+            None
+        }
+    })
+}
+
+fn time_coordinate_path(multiscale: &Value, time_axis: usize) -> Option<&str> {
+    fn find(transform: &Value, time_axis: usize) -> Option<&str> {
+        match transform.get("type").and_then(Value::as_str) {
+            Some("byDimension") => transform
+                .get("transformations")?
+                .as_array()?
+                .iter()
+                .find_map(|part| {
+                    let outputs = part.get("outputAxes")?.as_array()?;
+                    (outputs.len() == 1 && outputs[0].as_u64() == Some(time_axis as u64))
+                        .then(|| part.pointer("/transformation/path")?.as_str())
+                        .flatten()
+                }),
+            Some("sequence") => transform
+                .get("transformations")?
+                .as_array()?
+                .iter()
+                .find_map(|nested| find(nested, time_axis)),
+            _ => None,
+        }
+    }
+    multiscale
+        .get("coordinateTransformations")?
+        .as_array()?
+        .iter()
+        .find_map(|transform| find(transform, time_axis))
 }
 
 fn seconds_per_unit(unit: &str) -> Option<f64> {
@@ -327,6 +455,69 @@ fn seconds_per_unit(unit: &str) -> Option<f64> {
         "day" => 86400.0,
         _ => return None,
     })
+}
+
+fn write_time_coordinate_field(root: &Path, source: &TimeSeriesImage) -> Result<()> {
+    let group = root.join("coordinateTransformations/time");
+    let array_dir = group.join("0");
+    fs::create_dir_all(&array_dir).map_err(Error::backend)?;
+    let count = source.n_frames();
+    let unit_factor = source
+        .t
+        .and_then(|axis| source.axes[axis].get("unit").and_then(Value::as_str))
+        .and_then(seconds_per_unit)
+        .unwrap_or(1.0);
+    let values = source
+        .timeline
+        .iter()
+        .map(|frame| {
+            frame
+                .elapsed_seconds
+                .map_or(frame.t_index as f64, |seconds| seconds / unit_factor)
+        })
+        .collect::<Vec<_>>();
+    let metadata =
+        StorageLayout::chunked(vec![count.max(1), 1], Compression::for_dtype(Dtype::F64))
+            .array_metadata(
+                &[count, 1],
+                Dtype::F64,
+                json!(0.0),
+                Some(json!(["t", "coordinate"])),
+            )?;
+    write_json(&array_dir.join("zarr.json"), &metadata)?;
+    let store = std::sync::Arc::new(FilesystemStore::new(&group).map_err(Error::backend)?);
+    let array = ZarrArray::open(store, "/0").map_err(Error::backend)?;
+    array
+        .store_chunk(&[0, 0], &values)
+        .map_err(Error::backend)?;
+    let unit = source
+        .t
+        .and_then(|axis| source.axes[axis].get("unit").cloned())
+        .unwrap_or_else(|| json!("second"));
+    write_json(
+        &group.join("zarr.json"),
+        &json!({
+            "zarr_format":3,
+            "node_type":"group",
+            "attributes":{"ome":{
+                "version":"0.6",
+                "multiscales":[{
+                    "name":"exact acquired stack times",
+                    "coordinateSystems":[{"name":"time_coordinates", "axes":[
+                        {"name":"t", "type":"time", "unit":unit, "discrete":false},
+                        {"name":"coordinate", "type":"coordinate", "discrete":true}
+                    ]}],
+                    "datasets":[{
+                        "path":"0",
+                        "coordinateTransformations":[{
+                            "type":"scale", "scale":[1.0],
+                            "input":{"path":"0"}, "output":{"name":"time_coordinates"}
+                        }]
+                    }]
+                }]
+            }}
+        }),
+    )
 }
 
 /// A `t[,z],y,x` `uint64` label pyramid, one plane per frame.
@@ -391,10 +582,23 @@ impl LabelStack {
             let dir = root.join(index.to_string());
             fs::create_dir_all(&dir).map_err(Error::backend)?;
             write_json(&dir.join("zarr.json"), &metadata)?;
-            datasets.push(json!({
-                "path": index.to_string(),
-                "coordinateTransformations": project(&level.coordinate_transformations, &keep),
-            }));
+            let projected = project(&level.coordinate_transformations, &keep);
+            datasets.push(if source.ngff_06 {
+                json!({
+                    "path":index.to_string(),
+                    "coordinateTransformations":[{
+                        "type":"sequence",
+                        "input":{"path":index.to_string()},
+                        "output":{"name":"native"},
+                        "transformations":projected
+                    }]
+                })
+            } else {
+                json!({
+                    "path":index.to_string(),
+                    "coordinateTransformations":projected,
+                })
+            });
             shapes.push(shape);
         }
         let axes: Vec<Value> = keep
@@ -405,18 +609,38 @@ impl LabelStack {
                 Some(other) => other.clone(),
             })
             .collect();
+        let axis_count = axes.len();
+        let multiscale = if source.ngff_06 {
+            json!({
+                "coordinateSystems":[
+                    {"name":"physical", "axes":axes.clone()},
+                    {"name":"native", "axes":axes}
+                ],
+                "datasets":datasets,
+                "coordinateTransformations":[{
+                    "type":"byDimension", "input":{"name":"native"}, "output":{"name":"physical"},
+                    "transformations":[
+                        {"transformation":{"type":"coordinates", "path":"coordinateTransformations/time"}, "inputAxes":[0], "outputAxes":[0]},
+                        {"transformation":{"type":"identity"}, "inputAxes":(1..axis_count).collect::<Vec<_>>(), "outputAxes":(1..axis_count).collect::<Vec<_>>()}
+                    ]
+                }]
+            })
+        } else {
+            json!({"axes":axes, "datasets":datasets})
+        };
+        let version = if source.ngff_06 { "0.6" } else { "0.5" };
         let group = json!({
             "zarr_format": 3,
             "node_type": "group",
             "attributes": {
-                "ome": {
-                    "version": "0.5",
-                    "multiscales": [{"axes": axes, "datasets": datasets}],
-                },
-                "image-label": {"version": "0.5", "source": {"image": source_reference}},
+                "ome": {"version":version, "multiscales":[multiscale]},
+                "image-label": {"version":version, "source": {"image": source_reference}},
             }
         });
         write_json(&root.join("zarr.json"), &group)?;
+        if source.ngff_06 {
+            write_time_coordinate_field(&root, source)?;
+        }
         Ok(Self {
             root,
             has_z: source.has_z(),
@@ -431,10 +655,7 @@ impl LabelStack {
         let multiscale = metadata
             .pointer("/attributes/ome/multiscales/0")
             .ok_or_else(|| Error::invalid(format!("{} is not a label stack", root.display())))?;
-        let rank = multiscale
-            .get("axes")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
+        let rank = multiscale_axes(multiscale).map_or(0, Vec::len);
         if rank != 3 && rank != 4 {
             return Err(Error::invalid(format!(
                 "{} has rank {rank}; a label stack is t,y,x or t,z,y,x",
@@ -670,12 +891,15 @@ impl LabelStack {
 /// Keep the entries of each scale/translation transform for `keep` axes;
 /// `None` is an axis the source lacks (scale 1, translation 0).
 fn project(transforms: &Value, keep: &[Option<usize>]) -> Value {
-    Value::Array(
-        transforms
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|transform| {
+    fn collect(rows: &[Value], keep: &[Option<usize>], out: &mut Vec<Value>) {
+        for transform in rows {
+            if transform.get("type").and_then(Value::as_str) == Some("sequence") {
+                if let Some(nested) = transform.get("transformations").and_then(Value::as_array) {
+                    collect(nested, keep, out);
+                }
+                continue;
+            }
+            let projected = (|| {
                 let kind = transform.get("type")?.as_str()?;
                 let key = match kind {
                     "scale" | "translation" => kind,
@@ -693,9 +917,17 @@ fn project(transforms: &Value, keep: &[Option<usize>]) -> Value {
                 object.insert("type".into(), Value::String(kind.into()));
                 object.insert(key.into(), Value::Array(projected));
                 Some(Value::Object(object))
-            })
-            .collect(),
-    )
+            })();
+            if let Some(projected) = projected {
+                out.push(projected);
+            }
+        }
+    }
+    let mut projected = Vec::new();
+    if let Some(rows) = transforms.as_array() {
+        collect(rows, keep, &mut projected);
+    }
+    Value::Array(projected)
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {

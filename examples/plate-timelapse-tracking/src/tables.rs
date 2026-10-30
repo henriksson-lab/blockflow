@@ -100,7 +100,7 @@ pub fn identity_graph(layer: &str) -> IdentityGraphMetadata {
     }
 }
 
-fn index(has_z: bool, extent: [usize; 3], frames: u64, prefix: &str) -> SpatialIndexSpec {
+pub fn index(has_z: bool, extent: [usize; 3], frames: u64, prefix: &str) -> SpatialIndexSpec {
     let mut axes = vec!["t"];
     if has_z {
         axes.push("z");
@@ -135,7 +135,7 @@ fn index(has_z: bool, extent: [usize; 3], frames: u64, prefix: &str) -> SpatialI
     }
 }
 
-fn coordinate_columns(has_z: bool, prefix: &str) -> Vec<ColumnSpec> {
+pub fn coordinate_columns(has_z: bool, prefix: &str) -> Vec<ColumnSpec> {
     let mut columns = vec![ColumnSpec::new(
         format!("{prefix}t"),
         DType::F64,
@@ -161,7 +161,7 @@ fn coordinate_columns(has_z: bool, prefix: &str) -> Vec<ColumnSpec> {
     columns
 }
 
-fn coordinates(has_z: bool, t: u64, at: [f64; 3]) -> Vec<ObjectValue> {
+pub fn coordinates(has_z: bool, t: u64, at: [f64; 3]) -> Vec<ObjectValue> {
     let mut values = vec![ObjectValue::F64(t as f64)];
     if has_z {
         values.push(ObjectValue::F64(at[0]));
@@ -171,7 +171,7 @@ fn coordinates(has_z: bool, t: u64, at: [f64; 3]) -> Vec<ObjectValue> {
     values
 }
 
-fn optional(value: Option<f64>) -> ObjectValue {
+pub fn optional(value: Option<f64>) -> ObjectValue {
     ObjectValue::F64(value.unwrap_or(f64::NAN))
 }
 
