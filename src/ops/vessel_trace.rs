@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 #[path = "vessel_trace_constraints.rs"]
 mod constraints;
 pub use constraints::{
-    ConstrainedTraceResult, PointMatch, RequiredPoint, candidate_branches,
-    fit_paths_with_required_points, trace_with_required_points,
+    candidate_branches, fit_paths_with_required_points, trace_with_required_points,
+    ConstrainedTraceResult, PointMatch, RequiredPoint,
 };
 use std::{cmp::Ordering, collections::BinaryHeap};
 
@@ -236,7 +236,7 @@ pub fn wall_supported_mask(
         .collect())
 }
 
-/// Evidence is finite in [0,1] (larger means more lumen-like); allowed=0 is a
+/// Evidence is finite in `[0,1]` (larger means more lumen-like); allowed=0 is a
 /// hard barrier. No-path is an error, never a straight-line fallback. Source and
 /// target fractional points are connected only when their entire snapped link
 /// is allowed. Endpoints remain fixed during bounded physical refinement.
@@ -462,7 +462,7 @@ pub fn trace(evidence: &[f32], allowed: &[u8], c: &TraceConfig) -> Result<TraceR
 }
 
 fn refine_path(
-    path: &mut Vec<[f64; 3]>,
+    path: &mut [[f64; 3]],
     penalty: &impl Fn(usize) -> f64,
     allowed: &[u8],
     c: &TraceConfig,
@@ -472,7 +472,7 @@ fn refine_path(
         return;
     }
     let pitch = c.spacing.iter().copied().fold(f64::INFINITY, f64::min);
-    let initial = path.clone();
+    let initial = path.to_vec();
     // Generalized from recall_relax_mask_graph: bounded coordinate descent
     // of image/medial attraction + physical bending + initial-path anchor.
     // Fixed endpoints and exact segment membership are hard constraints.
@@ -657,10 +657,7 @@ mod tests {
             3
         );
         assert_eq!(
-            r.paths
-                .iter()
-                .filter(|p| p.iter().any(|v| *v == [8., 5., 1.]))
-                .count(),
+            r.paths.iter().filter(|p| p.contains(&[8., 5., 1.])).count(),
             1
         );
     }
@@ -681,12 +678,10 @@ mod tests {
         assert_eq!(supported[6 + 13 * (6 + 13)], 1);
         assert_eq!(supported[1 + 13 * (1 + 13)], 0);
         assert_eq!(supported[6 + 13 * 6], 1);
-        assert!(
-            wall_supported_mask(&vec![1; gate.len()], shape, [1.; 3], 8)
-                .unwrap()
-                .iter()
-                .all(|&v| v == 0)
-        );
+        assert!(wall_supported_mask(&vec![1; gate.len()], shape, [1.; 3], 8)
+            .unwrap()
+            .iter()
+            .all(|&v| v == 0));
     }
     #[test]
     fn forbidden_septum_no_fallback() {
@@ -698,11 +693,9 @@ mod tests {
                 m[8 + 17 * (y + 17 * z)] = 0;
             }
         }
-        assert!(
-            trace(&vec![1.; n], &m, &c)
-                .unwrap_err()
-                .contains("no lumen")
-        );
+        assert!(trace(&vec![1.; n], &m, &c)
+            .unwrap_err()
+            .contains("no lumen"));
         assert!(!segment_ok([7., 5., 1.], [9., 5., 1.], c.shape, &m));
     }
     #[test]

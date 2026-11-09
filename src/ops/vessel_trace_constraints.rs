@@ -601,12 +601,12 @@ pub fn fit_paths_with_required_points(
                         continue;
                     }
                     let key = (branch, subset);
-                    if !cache.contains_key(&key) {
+                    if let std::collections::btree_map::Entry::Vacant(entry) = cache.entry(key) {
                         let r = route(
                             branch, subset, s.paths, s.fixed, s.points, s.penalty, s.evidence,
                             s.cfg, budget,
                         )?;
-                        cache.insert(key, r);
+                        entry.insert(r);
                     }
                     let Some(r) = cache.get(&key).unwrap() else {
                         continue;
@@ -682,7 +682,7 @@ pub fn fit_paths_with_required_points(
             .iter()
             .enumerate()
             .map(|(b, path)| (b, nearest(path, p.position, c.spacing)))
-            .min_by(|a, b| a.1.1.total_cmp(&b.1.1))
+            .min_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
             .unwrap();
         if d > p.radius + pitch * 1e-7 {
             return Err("Required point was not satisfied after refinement".into());
@@ -784,18 +784,16 @@ mod tests {
         for y in 3..=7 {
             set(&mut m, c.shape, 7, y);
         }
-        assert!(
-            trace_with_required_points(
-                &vec![1.; 135],
-                &m,
-                &c,
-                &[RequiredPoint {
-                    position: [7., 7., 0.],
-                    radius: 0.
-                }]
-            )
-            .is_err()
-        );
+        assert!(trace_with_required_points(
+            &vec![1.; 135],
+            &m,
+            &c,
+            &[RequiredPoint {
+                position: [7., 7., 0.],
+                radius: 0.
+            }]
+        )
+        .is_err());
     }
     #[test]
     fn y_tree_assigns_point_without_branch_id() {
@@ -825,11 +823,9 @@ mod tests {
         .unwrap();
         assert_eq!(r.paths.len(), 3);
         assert!(r.matches[0].distance < 1e-9);
-        assert!(
-            r.paths[r.matches[0].branch_index]
-                .iter()
-                .any(|p| p[0] == 1.)
-        );
+        assert!(r.paths[r.matches[0].branch_index]
+            .iter()
+            .any(|p| p[0] == 1.));
     }
     #[test]
     fn unordered_points_and_unchanged_other_branch() {
@@ -869,18 +865,16 @@ mod tests {
         for x in 1..=13 {
             m[x + 15 * 3] = 1;
         }
-        assert!(
-            trace_with_required_points(
-                &vec![1.; 270],
-                &m,
-                &c,
-                &[RequiredPoint {
-                    position: [7., 3., 1.],
-                    radius: 1.
-                }]
-            )
-            .is_err()
-        );
+        assert!(trace_with_required_points(
+            &vec![1.; 270],
+            &m,
+            &c,
+            &[RequiredPoint {
+                position: [7., 3., 1.],
+                radius: 1.
+            }]
+        )
+        .is_err());
         let r = trace_with_required_points(
             &vec![1.; 270],
             &m,
